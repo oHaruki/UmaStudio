@@ -185,6 +185,21 @@ details.panel[open] > summary::before { transform: rotate(90deg); }
 #vidFps { --cols: 2; }
 #propFit { --cols: 2; }
 #gizmoModes { --cols: 4; }
+#stageModes, #stageActs, #stageMore { --cols: 3; }
+#placeTabs { --cols: 7; margin-bottom: 8px; }
+#placeConds { gap: 4px; }
+#placeConds select { min-width: 0; }
+#stageTree { max-height: 260px; overflow-y: auto; border-radius: var(--r); }
+#stageTree .row:nth-child(odd) { background-color: var(--row); }
+#stageTree .row:nth-child(even) { background-color: var(--row-alt); }
+#stageTree .row:hover { background-color: var(--row-hi); }
+#stageTree .row.on { background-color: var(--sel-row); color: #fff; }
+#stageTree .row.off .t { opacity: .45; }
+#stageTree .row:not(.fam) .n { display: none; }
+#stageTree .row button { margin-left: auto; flex: none; }
+#stageTree .row.fam .n { margin-left: auto; }
+#stageTree .row.fam .n + button { margin-left: 4px; }
+#stageEditor { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--edge); padding-top: 8px; margin-top: 2px; }
 #addRow { --cols: 3; }
 
 /* props */
@@ -202,8 +217,8 @@ details.panel[open] > summary::before { transform: rotate(90deg); }
 .picRow { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .prop .val, .line .val { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .picRow .val { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
-#bgPicCtl { display: flex; flex-direction: column; gap: 4px; }
-#bgPicThumb { width: 56px; height: 32px; object-fit: cover; border-radius: 3px; background: #333; flex: none; }
+#bgPicCtl, #bgStageCtl { display: flex; flex-direction: column; gap: 4px; }
+#bgPicThumb, #bgStageThumb { width: 56px; height: 32px; object-fit: cover; border-radius: 3px; background: #333; flex: none; }
 
 /* --- status bar ------------------------------------------------------------------------------- */
 
@@ -444,6 +459,7 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
             <button class="chip" data-bg="#00b140">Green</button>
             <button class="chip" data-bg="custom">Color</button>
             <button class="chip" data-bg="picture" title="A game background or your own picture">Picture</button>
+            <button class="chip" data-bg="stage" title="A place from the game around her: concert stages, racecourses, Tracen, story and cut-in sets">Place</button>
           </div>
           <input type="color" id="bgColor" value="#88aaff" style="display:none">
           <div id="bgPicCtl" style="display:none">
@@ -452,6 +468,40 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
             <label class="num"><input type="range" id="bgX" min="-1" max="1" step="0.01" value="0"><span class="k">Left / right</span><output></output></label>
             <label class="num"><input type="range" id="bgY" min="-1" max="1" step="0.01" value="0"><span class="k">Up / down</span><output></output></label>
             <label class="num"><input type="range" id="bgBlur" min="0" max="16" step="0.5" value="0"><span class="k">Blur</span><output></output></label>
+          </div>
+          <div id="bgStageCtl" style="display:none">
+            <div class="picRow"><img id="bgStageThumb" alt=""><span class="val" id="bgStageName"></span><button class="b" id="bgStageChange">Change…</button></div>
+            <div class="line" id="placeConds">
+              <select id="placeSeason" class="field grow" title="Season (unset: spring)"></select>
+              <select id="placeWeather" class="field grow" title="Weather (unset: sunny)"></select>
+              <select id="placeTime" class="field grow" title="Time of day (unset: day)"></select>
+              <select id="placeAlt" class="field grow" title="The place comes in several versions (other decorations)"></select>
+            </div>
+            <label class="num" id="stageLightsRow" title="The beams, bulbs and LED walls. In the game each song dims and colours them"><input type="range" id="stageLights" min="0" max="100" step="5" value="40" data-unit="%"><span class="k">Stage lights</span><output></output></label>
+            <label class="check" id="stageCrowdRow"><input type="checkbox" id="stageCrowd" checked> Crowd</label>
+            <label class="check" id="stageFxRow" title="Smoke, fireworks, petals and sweeping spots the songs set off"><input type="checkbox" id="stageFx"> Effects</label>
+            <label class="check" title="Move, turn, resize or hide parts of the place, or stand her somewhere else on it"><input type="checkbox" id="stageEdit"> Edit the place</label>
+            <div id="stageEditor" style="display:none">
+              <div class="prop"><span>Picked</span><span class="val" id="stagePick">nothing</span></div>
+              <div class="seg" id="stageModes">
+                <button class="chip on" data-mode="translate" title="W">Move</button>
+                <button class="chip" data-mode="rotate" title="E">Turn</button>
+                <button class="chip" data-mode="scale" title="R">Size</button>
+              </div>
+              <div class="seg" id="stageActs">
+                <button class="chip" id="stageUp" title="The whole group this part belongs to">Whole group</button>
+                <button class="chip" id="stageHide" title="Delete">Hide</button>
+                <button class="chip" id="stagePartReset">Reset</button>
+              </div>
+              <div class="seg" id="stageMore">
+                <button class="chip" id="stageHer" title="Stand her somewhere else on the stage">Select her</button>
+                <button class="chip" id="stageUnhide">Show hidden</button>
+                <button class="chip" id="stageResetAll" title="Every change to this place undone">Reset place</button>
+              </div>
+              <input type="search" id="stageFind" class="field" placeholder="Find a part">
+              <div id="stageTree"></div>
+              <div class="hint">Pick a part in the list or click it in the view: what a click would take is outlined, clicking the same spot again takes the next thing behind it. W / E / R switch handles, Delete hides, Esc lets go. Kept per place.</div>
+            </div>
           </div>
         </div>
       </details>
@@ -525,7 +575,10 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
       <details class="panel" id="pnlStyle" open>
         <summary>Style</summary>
         <div class="body">
-          <label class="check"><input type="checkbox" id="physics" checked> Hair &amp; cloth physics</label>          <label class="check"><input type="checkbox" id="outline" checked> Outlines</label>
+          <label class="check"><input type="checkbox" id="physics" checked> Hair &amp; cloth physics</label>
+          <label class="check" title="Hair, ties and ribbons rest on her body and outfit instead of passing through"><input type="checkbox" id="bodyCol" checked> Body collisions</label>
+          <label class="num" title="Extra room between the body and the hair resting on it"><input type="range" id="bodyGap" min="0" max="20" step="1" value="0" data-unit=" mm"><span class="k">Body clearance</span><output></output></label>
+          <label class="check"><input type="checkbox" id="outline" checked> Outlines</label>
           <label class="num"><input type="range" id="outlineW" min="0" max="3" step="0.05" value="1" data-unit="×"><span class="k">Outline width</span><output></output></label>
         </div>
       </details>
@@ -563,6 +616,13 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
   <div class="top"><h2>Choose a prop</h2><input type="search" id="propFilter" placeholder="Search by number"><button class="b close" id="propPickerClose">Close</button></div>
   <div id="propGrid" class="grid"></div>
   <div class="foot hint">The game's hand props.</div>
+</div></div>
+
+<div id="stagePicker" class="modal"><div class="box">
+  <div class="top"><h2>Choose a place</h2><input type="search" id="placeFilter" placeholder="Search"><button class="b close" id="stagePickerClose">Close</button></div>
+  <div class="seg" id="placeTabs"></div>
+  <div id="stageGrid" class="grid"></div>
+  <div class="foot hint">Places from the game you have downloaded. One gets a preview here once you have opened it.</div>
 </div></div>
 
 <div id="imgPicker" class="modal"><div class="box">

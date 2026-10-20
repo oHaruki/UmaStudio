@@ -106,3 +106,12 @@ export const store = {
 /** True while typing in a field, so single-key shortcuts stay out of the way. */
 export const typing = () => ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName) &&
   !['checkbox', 'range', 'radio'].includes(document.activeElement.type);
+
+/** A gizmo drag ends once the left button is up, even when its pointerup never arrived
+ *  (focus lost mid-drag, or the right button still held when the left one let go). */
+export function endDragOnRelease(tc) {
+  const end = () => { if (tc.dragging) tc.pointerUp({ button: 0 }); };
+  // capture: before the gizmo's own pointermove turns it one more step
+  window.addEventListener('pointermove', e => { if (!(e.buttons & 1)) end(); }, true);
+  window.addEventListener('pointercancel', end, true);
+}

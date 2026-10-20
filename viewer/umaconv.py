@@ -13,6 +13,7 @@ import glob
 import json
 import math
 import os
+import re
 import struct
 import sys
 import zlib
@@ -214,6 +215,9 @@ FLOAT_PARAMS = ("_ToonStep", "_ToonFeather", "_RimStep", "_RimFeather", "_RimSha
                 "_OutlineWidth", "_OutlineBrightness", "_SpecularPower", "_EnvRate", "_EnvBias", "_CheekRate")
 COLOR_PARAMS = ("_RimColor", "_OutlineColor", "_ShadowColor", "_SpecularColor", "_faceShadowColor",
                 "_ToonBrightColor", "_ToonDarkColor", "_CharaColor")
+# and the ones its stage materials read
+STAGE_FLOATS = ("_ColorPower", "_Alpha", "_Cull", "_Mode", "_DstBlend")
+STAGE_COLORS = ("_Color", "_MulColor0", "_MulColor1", "_AddColor", "_BaseColor")
 
 
 # --- conversion ------------------------------------------------------------------------
@@ -348,8 +352,28 @@ def convert_model(pack, out):
     return {"chara": chara, "body": body, "head": head, "tail": tail, "paths": paths}
 
 
-def write_model(pack, sk, root, out, chara):
-    """model.gltf + model.bin + tex/: the skeleton and every renderer in the pack."""
+def skin_slots(indices, weights, n, bone_count):
+    """Joints and weights in the four slots glTF wants. Unity keeps as many per vertex as the
+    mesh's skin quality (1, 2 or 4), and a one-bone mesh can come without any weights."""
+    bi = np.array(indices, dtype=np.int64).reshape(n, -1)[:, :4]
+    k = bi.shape[1]
+    joints = np.zeros((n, 4), np.int64)
+    joints[:, :k] = np.clip(bi, 0, bone_count - 1)
+    bw = np.zeros((n, 4), np.float32)
+    if weights:
+        w = np.array(weights, dtype=np.float32).reshape(n, -1)[:, :k]
+        bw[:, :w.shape[1]] = w
+    else:
+        bw[:, 0] = 1
+    s = bw.sum(axis=1, keepdims=True)
+    s[s == 0] = 1
+    return joints.astype(np.uint16), bw / s
+
+
+def write_model(pack, sk, root, out, chara, tree_only=False, swap=None, fill=None):
+    """model.gltf + model.bin + tex/: the skeleton and every renderer in the pack (tree_only: only
+    the skinned ones whose object is in the skeleton too; swap: texture name -> one to use instead;
+    fill: "texture head|tail" -> the texture for materials that ship without a main one)."""
     os.makedirs(os.path.join(out, "tex"), exist_ok=True)
     g = Gltf()
     for n in sk.nodes:
@@ -410,6 +434,18 @@ def write_model(pack, sk, root, out, chara):
                     if n:
                         texs[slot] = n
                         break
+        if swap:
+            texs = {k: swap.get(v, v) if swap.get(v) in pack.textures else v for k, v in texs.items()}
+        if fill and "_MainTex" not in texs:
+            # mtl_env_race10006_0000_002_turf00_lm00 -> the tex_env_race10006_0000_<code>_turf00 in use
+            base = re.sub(r"(_lm\d+|_H)+$", "", m.m_Name.replace("mtl_", "tex_", 1))
+            fam = re.fullmatch(r"(tex_.*?_)\d{3}(_.+)", base)
+            name = fam and fill.get(fam.group(1) + "|" + fam.group(2))
+            if name in pack.textures:
+                texs["_MainTex"] = name
+        if "CyalumeDefault" in shader_name and "_MainTex" not in texs:
+            # the crowd's glow sticks get a song's stick sheet at runtime: one came with the pack
+            texs.update({"_MainTex": n for n in pack.textures if n.startswith("tex_live_cyalume_")})
         if info.get("mini"):
             texs.update(mini_textures(pack, info, m.m_Name, texs))
         mask = None
@@ -417,8 +453,8 @@ def write_model(pack, sk, root, out, chara):
             texs.update(mob_textures(pack, info, m.m_Name, texs))
             if "_MaskColorTex" in texs:
                 mask = mob_mask(info, m.m_Name)
-        floats = {k: v for k, v in props.m_Floats if k in FLOAT_PARAMS}
-        colors = {k: [c.r, c.g, c.b, c.a] for k, c in props.m_Colors if k in COLOR_PARAMS}
+        floats = {k: v for k, v in props.m_Floats if k in FLOAT_PARAMS or k in STAGE_FLOATS}
+        colors = {k: [c.r, c.g, c.b, c.a] for k, c in props.m_Colors if k in COLOR_PARAMS or k in STAGE_COLORS}
         mat = {"name": m.m_Name, "pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1},
                "extras": {"shader": shader_name, "textures": {}, "floats": floats, "colors": colors, "mesh": smr_name}}
         if mask:
@@ -442,23 +478,30 @@ def write_model(pack, sk, root, out, chara):
         if not n:
             return
 
-        pos = np.array(h.m_Vertices, dtype=np.float32).reshape(n, 3)
+        def channel(data, k, pad=0.0):
+            # a channel is as wide as the mesh stores it (stage normals come with 4, some colors with 3)
+            a = np.array(data, dtype=np.float32).reshape(n, -1)
+            if a.shape[1] < k:
+                a = np.hstack([a, np.full((n, k - a.shape[1]), pad, np.float32)])
+            return np.ascontiguousarray(a[:, :k])
+
+        pos = channel(h.m_Vertices, 3)
         pos[:, 0] *= -1
         attrs = {"POSITION": g.accessor(pos, FLOAT, "VEC3", ARRAY_BUFFER, minmax=True)}
         if h.m_Normals:
-            nrm = np.array(h.m_Normals, dtype=np.float32).reshape(n, 3)
+            nrm = channel(h.m_Normals, 3)
             nrm[:, 0] *= -1
             attrs["NORMAL"] = g.accessor(nrm, FLOAT, "VEC3", ARRAY_BUFFER)
         if h.m_UV0:
-            uv = np.array(h.m_UV0, dtype=np.float32).reshape(n, 2)
+            uv = channel(h.m_UV0, 2)
             uv[:, 1] = 1 - uv[:, 1]
             attrs["TEXCOORD_0"] = g.accessor(uv, FLOAT, "VEC2", ARRAY_BUFFER)
         if h.m_UV1:
-            uv1 = np.array(h.m_UV1, dtype=np.float32).reshape(n, 2)
+            uv1 = channel(h.m_UV1, 2)
             uv1[:, 1] = 1 - uv1[:, 1]
             attrs["TEXCOORD_1"] = g.accessor(uv1, FLOAT, "VEC2", ARRAY_BUFFER)
         if h.m_Colors:
-            col = np.array(h.m_Colors, dtype=np.float32).reshape(n, 4)
+            col = channel(h.m_Colors, 4, 1.0)
             if col.max() > 1.0:
                 col /= 255.0
             attrs["COLOR_0"] = g.accessor(col, FLOAT, "VEC4", ARRAY_BUFFER)
@@ -469,14 +512,9 @@ def write_model(pack, sk, root, out, chara):
             for b in smr.m_Bones:
                 r = deref(b)
                 bones.append(sk.by_unity.get(obj_key(r), root) if r else root)
-            if bones and h.m_BoneIndices and h.m_BoneWeights:
-                bi = np.array(h.m_BoneIndices, dtype=np.int64).reshape(n, 4)
-                bw = np.array(h.m_BoneWeights, dtype=np.float32).reshape(n, 4)
-                bi = np.clip(bi, 0, len(bones) - 1)
-                s = bw.sum(axis=1, keepdims=True)
-                s[s == 0] = 1
-                bw = bw / s
-                attrs["JOINTS_0"] = g.accessor(bi.astype(np.uint16), USHORT, "VEC4", ARRAY_BUFFER)
+            if bones and h.m_BoneIndices:
+                bi, bw = skin_slots(h.m_BoneIndices, h.m_BoneWeights, n, len(bones))
+                attrs["JOINTS_0"] = g.accessor(bi, USHORT, "VEC4", ARRAY_BUFFER)
                 attrs["WEIGHTS_0"] = g.accessor(bw, FLOAT, "VEC4", ARRAY_BUFFER)
                 ibm = np.stack([conv_matrix(unity_matrix(m)).T for m in mesh_r.read_typetree()["m_BindPose"]])
                 g.doc["skins"].append({"name": name, "joints": bones,
@@ -509,6 +547,8 @@ def write_model(pack, sk, root, out, chara):
 
     for o in pack.by_type.get("SkinnedMeshRenderer", []):
         smr = o.read()
+        if tree_only and (o.assets_file.name, smr.m_GameObject.path_id) not in sk.by_go:
+            continue
         owner = deref(smr.m_GameObject)
         mesh_r = deref(smr.m_Mesh)
         if mesh_r:
@@ -545,6 +585,25 @@ def convert_prop(files, out):
     root = sk.add_tree(reader, t, None)
     meshes = write_model(pack, sk, root, out, "0000")
     info = {"name": name, "meshes": meshes}
+    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(info, f)
+    return info
+
+
+def convert_stage(files, out, swap=None, fill=None):
+    """A concert stage (3d/env/live/liveNNNNN): every prefab its controller puts up, all at the
+    origin (stage, screens, light rigs, crowd, sky), as one model. Particles and lens flares have no
+    mesh renderer and stay out, so do the collision prefabs, the front-row fans (skinned, the
+    controller places them in rows and animates them, left alone they lie at the origin in T-pose)
+    and the source models the prefabs pull in (mdl_*, the prefabs already place them)."""
+    pack = Pack(files=files)
+    sk = Skeleton()
+    root = sk.add("stage", None, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0])
+    for name, (reader, t) in sorted(pack.roots().items()):
+        if "collision" not in name and "_audience" not in name and not name.startswith("mdl_"):
+            sk.add_tree(reader, t, root)
+    meshes = write_model(pack, sk, root, out, "0000", tree_only=True, swap=swap, fill=fill)
+    info = {"name": os.path.basename(out), "meshes": meshes}
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(info, f)
     return info

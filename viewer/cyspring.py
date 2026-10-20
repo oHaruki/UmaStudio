@@ -14,6 +14,7 @@ import array
 import ctypes
 import math
 import os
+import re
 import struct
 
 # NativeClothWorking (0x168 bytes)
@@ -27,14 +28,29 @@ CINDEX_LO, CINDEX_HI = 0x0F4, 0x154  # 8 + 8 int16 collision indices
 DYN_RATIO, ANIM_ROT = 0x104, 0x108
 MOVE_RATE, PARENT_WORK, IS_ADD = 0x13C, 0x140, 0x164
 WORK = 0x168
-# NativeClothCollision (0x4C bytes)
+# NativeClothCollision (0x4C bytes). ffs: the solver skips every collision whose enable flag is 0.
+# IsCharaCollision ones are skipped for bones that don't check collisions
 C_POS, C_POS2, C_NORMAL, C_TYPE, C_INNER, C_RADIUS, C_DIST, C_PARENT = 0x00, 0x10, 0x20, 0x30, 0x34, 0x38, 0x3C, 0x40
+C_ENABLED, C_CHARA = 0x44, 0x48
 COL = 0x4C
 # NativeRootParentWork (0x20 bytes): position, rotation
 PARENT = 0x20
+# NativeSkirt (0x60 bytes), one per skirt panel: its root and target positions, the outward
+# normal, the axis it swings out about, which legs it checks (right knee, left knee, right ankle,
+# left ankle) and the angle NativeSkirtUpdate works out
+SK_ROOT, SK_TARGET, SK_NORMAL, SK_AXIS, SK_CHECK, SK_ANGLE = 0x00, 0x10, 0x20, 0x30, 0x40, 0x50
+SKIRT = 0x60
+# NativeSkirtArg (0x70 bytes): knee L, knee R, ankle L, ankle R, the center bone, the origin,
+# then knee radius, ankle radius, influence angle and max angle (degrees)
+SA_LEGS, SA_CENTER, SA_ORIGIN, SA_PARAMS = 0x00, 0x40, 0x50, 0x60
+SKIRT_ARG = 0x70
 
 SPHERE, NONE, CAPSULE, PLANE = 0, 1, 2, 3
+MAX_COLLISIONS = 16                # index slots per bone on the native side
 MIN_BONE_DISTANCE = 1e-4
+# springs that also collide with the body fitted to her outfit (bodyfit.js): hair, and ties,
+# ribbons and collars on the chest and neck. not the bust (inside her), ears, tail or the hips' cloth
+BODY_SPRINGS = re.compile(r"^Sp_(He_Hair|Ch_(?!Bust)|Ne_)")
 TICK = 1 / 60
 PARTS = ("head", "body", "tail")
 
@@ -60,10 +76,14 @@ def plugin():
         if not game:
             raise RuntimeError("CySpringPlugin.dll was not found: is the game installed through Steam?")
         dll = ctypes.CDLL(os.path.join(game, DLL))
+        tail = [ctypes.c_float] * 7 + [ctypes.c_bool, ctypes.c_float, ctypes.c_bool] + [ctypes.c_float] * 3
         f = dll.NativeClothUpdate
         f.restype = None
-        f.argtypes = ([ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_float] * 7
-                      + [ctypes.c_bool, ctypes.c_float, ctypes.c_bool] + [ctypes.c_float] * 3)
+        f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p] + tail
+        # same, with the skirt panel and the legs in front of the parent work
+        f = dll.NativeClothSkirtUpdate
+        f.restype = None
+        f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p] + tail
         _dll = dll
     return _dll
 
@@ -112,6 +132,14 @@ def length(a):
 def normalize(a):
     n = length(a)
     return scale(a, 1 / n) if n > 1e-12 else (0.0, 0.0, 0.0)
+
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
 
 
 def from_to(a, b):
@@ -193,6 +221,7 @@ class Root:
         self.part, self.element, self.is_add, self.bones = part, element, is_add, bones
         self.buf = ctypes.create_string_buffer(WORK * len(bones))
         self.count = len(bones)
+        self.skirt = None   # set when the game's skirt controller drives this root
 
 
 class Part:
@@ -207,7 +236,7 @@ class Simulation:
     """One character's springs. `nodes` is the rest skeleton: [name, parent index or -1,
     local position, local rotation, local scale], Unity space, root at the origin."""
 
-    def __init__(self, physics, nodes):
+    def __init__(self, physics, nodes, body_fit=None):
         self.dll = plugin()
         self.names = [n[0] for n in nodes]
         self.parent = [n[1] for n in nodes]
@@ -240,15 +269,25 @@ class Simulation:
                 self.work_nodes.append(node)
             return work_index[node]
 
-        # collision objects per part: head (+ bust as add data), body, tail. the body gives up the
-        # ones the tail's springs use and the tail gets exactly those.
+        # collision objects per part: head (+ bust as add data), body, tail. a spring can name a
+        # collider another part made (the tail's Col_B_*_Tail sit in the body's list), so every part
+        # also gets those. the body gives up the tail's ones unless its own springs use them too.
         made = {}
         cols = {"head": self.make_collisions(head, bust, made), "body": self.make_collisions(body, None, made),
                 "tail": self.make_collisions(tail, None, made)}
-        if tail is not None:
-            tail_names = collision_names(tail)
-            cols["tail"] = [c for c in cols["body"] if c["name"] in tail_names]
-            cols["body"] = [c for c in cols["body"] if c["name"] not in tail_names]
+        for name, main, extra in (("head", head, bust), ("body", body, None), ("tail", tail, None)):
+            if main is None:
+                continue
+            want = collision_names(main) | (collision_names(extra) if extra else set())
+            have = {c["name"] for c in cols[name]}
+            cols[name] += [made[n] for n in sorted(want - have) if n in made]
+        if tail is not None and body is not None:
+            tail_only = collision_names(tail) - collision_names(body)
+            cols["body"] = [c for c in cols["body"] if c["name"] not in tail_only]
+        self.body = self.make_body(body_fit or {})
+        if self.body:
+            cols["head"] += self.body
+            cols["body"] += self.body
         for name, main, extra in (("head", head, bust), ("body", body, None), ("tail", tail, None)):
             if main is None:
                 continue
@@ -262,6 +301,8 @@ class Simulation:
                 puti(root.buf, PARENT_WORK, work(self.parent[root.bones[0].node]))
             for k, c in enumerate(part.collisions):
                 puti(part.col_buf, k * COL + C_PARENT, work(c["node"]))
+        self.skirt_arg = None
+        self.setup_skirt(physics.get("skirt"), work)
         self.work_buf = ctypes.create_string_buffer(PARENT * max(1, len(self.work_nodes)))
         self.roots = [root for part in self.parts for root in part.roots]
         self.bones = [b for root in self.roots for b in root.bones]
@@ -297,7 +338,7 @@ class Simulation:
                     col["pos"] = mul3(offset, ls)
                 elif kind == CAPSULE:
                     col["pos"] = mul3(offset, ls)
-                    col["pos2"] = add(col["pos"], sub(offset2, offset))
+                    col["pos2"] = mul3(offset2, ls)
                 elif kind == PLANE:
                     # placed in world space at load, its forward is the plane normal
                     rot = from_to((0.0, 1.0, 0.0), v3(c["_normal"]))
@@ -308,6 +349,101 @@ class Simulation:
                 made[name] = col
                 out.append(col)
         return out
+
+    def make_body(self, fit):
+        """Collision objects for the shapes bodyfit.js fitted to her outfit: {bone, a, b, r} with
+        a and b in the bone's space (unity axes), plus the clearance on top of every radius."""
+        out = []
+        extra = float(fit.get("clearance", 0.0))
+        for k, c in enumerate(fit.get("shapes", [])):
+            node = self.by_name.get(c["bone"])
+            if node is None:
+                continue
+            ls = self.world[node].s
+            a, b = mul3(tuple(c["a"]), ls), mul3(tuple(c["b"]), ls)
+            kind = CAPSULE if length(sub(a, b)) > 1e-4 else SPHERE
+            out.append({"name": f"UmaStudio_Body{k}", "node": node, "type": kind, "radius": float(c["r"]) + extra,
+                        "inner": 0, "pos": a, "pos2": b if kind == CAPSULE else (0.0, 0.0, 0.0),
+                        "normal": (0.0, 0.0, 0.0), "distance": 0.0})
+        return out
+
+    def body_gap(self, c, p):
+        """How far rest-pose point p is outside body collider c (negative: inside)."""
+        w = self.world[c["node"]]
+        a = add(w.p, qrot(w.q, c["pos"]))
+        if c["type"] == CAPSULE:
+            b = add(w.p, qrot(w.q, c["pos2"]))
+            ab = sub(b, a)
+            t = max(0.0, min(1.0, dot(sub(p, a), ab) / max(dot(ab, ab), 1e-12)))
+            a = add(a, scale(ab, t))
+        return length(sub(p, a)) - c["radius"]
+
+    def body_for(self, root, b, free):
+        """The body colliders spring bone b checks: the nearest ones that fit in its free slots,
+        leaving out any its chain starts well inside (it would be shoved out every tick)."""
+        if not self.body or free <= 0 or not BODY_SPRINGS.match(b.name):
+            return []
+        start, here = self.world[root.bones[0].node].p, self.world[b.node].p
+        ok = [c for c in self.body if self.body_gap(c, start) > -0.02]
+        ok.sort(key=lambda c: self.body_gap(c, here))
+        return [c["name"] for c in ok[:free]]
+
+    def setup_skirt(self, data, work):
+        """The game's SkirtController: skirt panels swing out of the way of the knees (and the
+        ankles on long skirts) instead of the legs going through them. NativeClothSkirtUpdate keeps
+        a panel's bones outside a plane through its root, turned out by the angle it finds to clear
+        the legs. The managed side that fills normal and axis can't be read, so they come from the
+        rest pose here: outward from the center bone, and the axis that swings the panel that way."""
+        if not data or not data.get("m_Enabled", 1):
+            return
+        legs = [self.by_name.get(data.get(k) or "")
+                for k in ("_kneeLBoneName", "_kneeRBoneName", "_ankleLBoneName", "_ankleRBoneName")]
+        center = self.by_name.get(data.get("_centerBoneName") or "")
+        if center is None or (legs[0] is None and legs[1] is None):
+            return
+        knee_r, ankle_r = float(data.get("_kneeColliderRadius", 0.0)), float(data.get("_ankleColliderRadius", 0.0))
+        roots = {self.names[r.bones[0].node]: r for part in self.parts for r in part.roots}
+        for e in data.get("_skirtBone", []):
+            root, target = roots.get(e["_rootBoneName"]), self.by_name.get(e["_childBoneName"])
+            if root is None or target is None:
+                continue
+            node = root.bones[0].node
+            parent = self.parent[node]
+            if data.get("IsOffsetAngleTargetEndNode"):
+                chain = {b.node for b in root.bones}
+                while True:
+                    nxt = [c for c in self.children[target] if c in chain]
+                    if not nxt:
+                        break
+                    target = nxt[0]
+            r, t, c = self.world[node].p, self.world[target].p, self.world[center].p
+            u = normalize(sub(t, r))
+            out = sub(r, c)
+            n = normalize(sub(out, scale(u, dot(out, u))))
+            a = normalize(cross(u, n))
+            if length(n) < 0.5 or length(a) < 0.5:
+                continue
+            inv = qinv(self.world[parent].q)
+            buf = ctypes.create_string_buffer(SKIRT)
+            right, left = bool(e.get("_isCheckRightLeg")), bool(e.get("_isCheckLeftLeg"))
+            struct.pack_into("<4i", buf, SK_CHECK, right and legs[1] is not None, left and legs[0] is not None,
+                             right and legs[3] is not None and ankle_r > 0, left and legs[2] is not None and ankle_r > 0)
+            root.skirt = {"parent": parent, "target": qrot(inv, sub(t, r)), "normal": qrot(inv, n),
+                          "axis": qrot(inv, a), "buf": buf}
+        if not any(getattr(r, "skirt", None) for r in roots.values()):
+            return
+        self.skirt_arg = ctypes.create_string_buffer(SKIRT_ARG)
+        struct.pack_into("<4f", self.skirt_arg, SA_PARAMS, knee_r, ankle_r,
+                         float(data.get("_influenceAngle", 0.0)), float(data.get("_influenceMaxAngle", 0.0)))
+        self.skirt_legs = [work(n) if n is not None else None for n in legs]
+        self.skirt_center = work(center)
+
+    def put_skirt_arg(self, parents):
+        a = self.skirt_arg
+        for k, w in enumerate(self.skirt_legs):
+            # a missing leg sits far away, its check is off anyway
+            put3(a, SA_LEGS + 0x10 * k, parents[w][0] if w is not None else (0.0, -100.0, 0.0))
+        put3(a, SA_CENTER, parents[self.skirt_center][0])
 
     def bind(self, part):
         table = {}
@@ -332,14 +468,16 @@ class Simulation:
             puti(part.col_buf, o + C_INNER, c["inner"])
             putf(part.col_buf, o + C_RADIUS, c["radius"])
             putf(part.col_buf, o + C_DIST, c["distance"])
+            puti(part.col_buf, o + C_ENABLED, 1)
         for root in part.roots:
             for b in root.bones:
                 o = b.index * WORK
-                names = list(b.element.get("_collisionNameList", []))
+                names = [n for n in b.element.get("_collisionNameList", []) if n in table]
+                names += self.body_for(root, b, MAX_COLLISIONS - len(names))
                 active = 0
                 for n in names:
                     k = table.get(n)
-                    if k is None:
+                    if k is None or active == MAX_COLLISIONS:
                         continue
                     if active < 8:
                         struct.pack_into("<h", root.buf, o + CINDEX_LO + 2 * active, k)
@@ -505,13 +643,28 @@ class Simulation:
                     if b.exist:
                         put4(root.buf, b.index * WORK + ANIM_ROT, local_rot[k])
                     k += 1
+        if self.skirt_arg is not None:
+            self.put_skirt_arg(parents)
         for part in self.parts:
             main_rate = self.hip_rate(part.main, part.main, distance)
             add_rate = self.hip_rate(part.add, part.main, distance)
             cols = part.col_buf if part.collisions else None
+            rest = (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, True, 1.0, True, main_rate, add_rate, 1.0)
             for root in part.roots:
-                self.dll.NativeClothUpdate(root.buf, root.count, cols, self.work_buf, 1.0, 1.0, 1.0,
-                                           0.0, 0.0, 0.0, 0.0, True, 1.0, True, main_rate, add_rate, 1.0)
+                sk = root.skirt
+                if sk is None or self.skirt_arg is None:
+                    self.dll.NativeClothUpdate(root.buf, root.count, cols, self.work_buf, *rest)
+                    continue
+                # the panel as the animation has it: root where the solver has it, target
+                # from the root's rest rotation under its parent's current one
+                w = pose[sk["parent"]]
+                r = get3(root.buf, SELF_POS)
+                put3(sk["buf"], SK_ROOT, r)
+                put3(sk["buf"], SK_TARGET, add(r, qrot(w.q, sk["target"])))
+                put3(sk["buf"], SK_NORMAL, qrot(w.q, sk["normal"]))
+                put3(sk["buf"], SK_AXIS, qrot(w.q, sk["axis"]))
+                self.dll.NativeClothSkirtUpdate(root.buf, root.count, cols, sk["buf"], self.skirt_arg,
+                                                self.work_buf, *rest)
         self.hip_prev = hip
         out = []
         for part in self.parts:

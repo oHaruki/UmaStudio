@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { kindOf, makeMaterial, makeOutline } from '/static/look.js';
-import { $, $$, post, getJson, toast, store, radio, typing, busy, showTab } from '/static/ui.js';
+import { $, $$, post, getJson, toast, store, radio, typing, busy, showTab, endDragOnRelease } from '/static/ui.js';
 import { pickImage, pictureName, onPictureDropped } from '/static/images.js';
 
 // props: the game's hand props, or one of your pictures as a card or a box, held by the Uma.
@@ -643,6 +643,7 @@ export function initProps(c) {
     ctx.controls.enabled = !e.value;
     if (!e.value) { save(); syncEditor(); }
   });
+  endDragOnRelease(tc);
   ctx.scene.add(tc);
 
   $('#addProp').onclick = openPicker;
@@ -695,7 +696,7 @@ export function initProps(c) {
     if (!down || e.button !== 0 || tc.dragging) return;
     const moved = Math.hypot(e.clientX - down[0], e.clientY - down[1]);
     down = null;
-    if (moved > 4 || !list.length) return;
+    if (moved > 4 || !list.length || e.defaultPrevented) return;   // defaultPrevented: pose mode picked a joint
     const r = ctx.canvas.getBoundingClientRect();
     raycaster.setFromCamera(new THREE.Vector2((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1), ctx.camera);
     const hit = raycaster.intersectObjects(list.filter(p => p.visible).map(p => p.holder), true)[0];
@@ -704,6 +705,7 @@ export function initProps(c) {
       while (o && !list.some(p => p.holder === o)) o = o.parent;
       const p = list.find(q => q.holder === o);
       if (p && p !== selected) select(p);
+      e.preventDefault();   // taken: stage editing leaves it alone
     } else if (selected && tc.axis === null) select(null);
   });
 

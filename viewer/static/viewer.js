@@ -3,6 +3,9 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { GameSprings, TICK } from '/static/physics.js';
+import { fitBody } from '/static/bodyfit.js';
+import { loadStage, showParts, faceCamera, partKinds } from '/static/stage.js';
+import { initStageEdit, stageLoaded, stageShown, updateStageEdit, stageGizmo } from '/static/stagedit.js';
 import { U, kindOf, makeMaterial, makeOutline } from '/static/look.js';
 import { $, $$, call, post, getJson, toast, radio, store, busy, initChrome } from '/static/ui.js';
 import { pickImage, pictureName } from '/static/images.js';
@@ -21,12 +24,26 @@ renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
 const scene = new THREE.Scene();
+// she hangs under this: on a stage it stands her where she was put (stagedit.js), else the origin
+const place = new THREE.Group();
+place.name = 'placement';
+scene.add(place);
 const camera = new THREE.PerspectiveCamera(25, 1, 0.03, 100);
 camera.position.set(0, 0.9, 4.2);
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 0.85, 0);
 controls.enableDamping = true;
 controls.update();
+// a camera drag whose pointerup never came (focus lost mid-drag) keeps turning with the mouse.
+// the first move with no button ends it, ahead of the orbit's own pointermove, through the
+// orbit's pointercancel handling
+let orbiting = false;
+controls.addEventListener('start', () => { orbiting = true; });
+controls.addEventListener('end', () => { orbiting = false; });
+window.addEventListener('pointermove', e => {
+  if (orbiting && !e.buttons && e.pointerType !== 'touch')
+    canvas.dispatchEvent(new PointerEvent('pointercancel', { pointerId: e.pointerId, pointerType: e.pointerType }));
+}, true);
 
 function resize() {
   const w = stage.clientWidth, h = stage.clientHeight;
@@ -69,6 +86,7 @@ async function start() {
     return;
   }
   $('#setup').style.display = 'none';
+  if (shot.bg === 'stage' && liveStage.id) openStage(liveStage.id).catch(e => toast(e.message, true));
   charas = (await getJson('/api/charas')).charas;
   fillUmas();
   const last = store.get('last', null);
@@ -156,21 +174,26 @@ async function chooseUma(c, dressId) {
   await openUma(c, d);
 }
 
+// the newest pick wins: an older load (a first-time convert is slow) that finishes later is dropped
+let umaSeq = 0;
 async function openUma(c, d) {
+  const seq = ++umaSeq, stale = () => seq !== umaSeq;
   $('#umaOutfit').textContent = d.name;
   $('#overlay').textContent = `Loading ${c.name}…`;
   $('#overlay').style.display = 'flex';
   try {
     const r = await post('/api/load', { chara: c.id, dress: d.id }, `Loading ${c.name}…`);
-    await busy(`Loading ${c.name}…`, loadModel(r.pack, r.manifest, r.sets, c, d));
-    store.set('last', { chara: c.id, dress: d.id });
+    if (stale()) return;
+    await busy(`Loading ${c.name}…`, loadModel(r.pack, r.manifest, r.sets, c, d, stale));
+    if (!stale()) store.set('last', { chara: c.id, dress: d.id });
   } catch (e) {
+    if (stale()) return;
     $('#overlay').textContent = '';
     toast(e.message, true);
   }
 }
 
-async function loadModel(pack, manifest, sets, chara, dress) {
+async function loadModel(pack, manifest, sets, chara, dress, stale = () => false) {
   const base = `/data/${encodeURIComponent(pack)}/`;
   const gltf = await new GLTFLoader().loadAsync(base + 'model.gltf');
 
@@ -223,12 +246,16 @@ async function loadModel(pack, manifest, sets, chara, dress) {
     }
   }
 
+  if (stale()) {
+    gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+    return;
+  }
   if (current) {
-    scene.remove(current.root);
+    place.remove(current.root);
     current.root.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
   }
   const root = gltf.scene;
-  scene.add(root);
+  place.add(root);
   const rest = new Map();
   root.traverse(o => { if (o.isBone || o.type === 'Object3D') rest.set(o, [o.position.clone(), o.quaternion.clone(), o.scale.clone()]); });
   current = { pack, base, manifest, sets, root, rest, outlines, chara: chara.id, name: chara.name, dress: dress.name, miniParts,
@@ -237,19 +264,12 @@ async function loadModel(pack, manifest, sets, chara, dress) {
   current.mixer.timeScale = parseFloat($('#speed').value);
   props.onModel(current);
   pose.onModel(current);
-  if (manifest.physics) {
-    // set up while every bone is at rest, like the game binds its springs
-    const mine = current;
-    GameSprings.create(root, rest, pack).then(sp => {
-      if (current !== mine || !sp) return;
-      mine.springs = sp;
-      sp.setEnabled($('#physics').checked);
-    }).catch(e => toast('Physics: ' + e.message, true));
-  }
+  if (manifest.physics) newSprings();
   current.process = bindProcess(manifest.process || []);
   outlines.forEach(o => { o.visible = $('#outline').checked; });
   $('#overlay').style.display = 'none';
   await loadFace();
+  if (stale()) return;
   setCamera(shot.cam);
   fillPoses();
   // chibis pose from the chibi motions, everyone else not
@@ -474,6 +494,14 @@ async function libraryClip(path) {
   return clip;
 }
 
+// the motion only rewrites the bones it has tracks for, so what went on top of it last time
+// comes off first, newest first: the head turn, then the pose mode offsets
+function runMotion(dt) {
+  liftHeadTurn();
+  pose.liftEdits();
+  current.mixer.update(dt);
+}
+
 function restPose() {
   current.mixer.stopAllAction();
   current.action = null;
@@ -494,7 +522,7 @@ async function playClip(clip, key, autoplay, title) {
   $$('#poses .row.set').forEach(markPose);
   $('#scrub').max = clip.duration;
   setPlaying(!!autoplay);
-  current.mixer.update(0);
+  runMotion(0);
   props.applyGrips();
 }
 
@@ -514,7 +542,7 @@ $('#scrub').oninput = () => {
   if (!current || !current.action) return;
   setPlaying(false);
   current.action.time = parseFloat($('#scrub').value);
-  current.mixer.update(0);
+  runMotion(0);
   current.springs?.reset();
   updateTime();
 };
@@ -736,14 +764,18 @@ const UP = new THREE.Vector3(0, 1, 0);
 const _f = new THREE.Vector3(), _t = new THREE.Vector3(), _axis = new THREE.Vector3();
 const _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _q3 = new THREE.Quaternion();
 
+// bones the motion didn't set since still hold the last turn, so back to base
+function liftHeadTurn() {
+  for (const [b, s] of look.set) if (b.quaternion.equals(s.applied)) b.quaternion.copy(s.base);
+  look.set.clear();
+}
+
 /** Before applyEyeTrace: neck and head turned toward the camera. dt in seconds (0: no easing). */
 function applyHeadTurn(dt) {
   const neck = current.named.Neck ??= current.root.getObjectByName('Neck') || null;
   const head = current.named.Head ??= current.root.getObjectByName('Head') || null;
   if (!neck || !head) return;
-  // bones the motion didn't set this frame still hold last frame's turn, so back to base
-  for (const [b, s] of look.set) if (b.quaternion.equals(s.applied)) b.quaternion.copy(s.base);
-  look.set.clear();
+  liftHeadTurn();
   head.updateWorldMatrix(true, false);
   _f.set(0, 0, 1).transformDirection(head.matrixWorld);   // where the motion has her face
   _t.copy(camera.position).sub(head.getWorldPosition(_axis)).normalize();
@@ -942,16 +974,223 @@ $('#eyeCell').onchange = () => U.eyeCell.value.set(+$('#eyeCell').value, 0);
 $('#eyeHi').oninput = () => { U.eyeHi.value = parseFloat($('#eyeHi').value); };
 $('#physics').onchange = () => current?.springs?.setEnabled($('#physics').checked);
 
-/** The color to clear to, 'picture', or '' for transparent. */
+// the springs, from the rest skeleton like the game binds them. with body collisions on, hair and
+// ties also get colliders fitted to her outfit (bodyfit.js), so changing those makes new springs
+function newSprings() {
+  const mine = current;
+  const body = $('#bodyCol').checked
+    ? { shapes: mine.bodyFit ??= fitBody(mine.root), clearance: parseFloat($('#bodyGap').value) / 1000 } : null;
+  GameSprings.create(mine.root, mine.rest, mine.pack, body).then(sp => {
+    if (current !== mine || !sp) return;
+    mine.springs = sp;
+    sp.setEnabled($('#physics').checked);
+  }).catch(e => toast('Physics: ' + e.message, true));
+}
+$('#bodyCol').checked = store.get('bodyCol', true);
+$('#bodyGap').value = store.get('bodyGap', 0);
+$('#bodyCol').onchange = () => { store.set('bodyCol', $('#bodyCol').checked); if (current?.manifest.physics) newSprings(); };
+$('#bodyGap').onchange = () => { store.set('bodyGap', +$('#bodyGap').value); if (current?.manifest.physics && $('#bodyCol').checked) newSprings(); };
+
+/** The color to clear to, 'picture', 'stage', or '' for transparent. */
 function background() {
-  const pic = shot.bg === 'picture';
-  const color = shot.bg === 'custom' ? $('#bgColor').value : pic ? '' : shot.bg;
+  const pic = shot.bg === 'picture', set = shot.bg === 'stage';
+  const color = shot.bg === 'custom' ? $('#bgColor').value : pic || set ? '' : shot.bg;
   $('#bgColor').style.display = shot.bg === 'custom' ? '' : 'none';
   $('#bgPicCtl').style.display = pic ? '' : 'none';
+  $('#bgStageCtl').style.display = set ? '' : 'none';
   scene.background = pic && bgPic.tex ? bgPic.tex : null;
   stage.classList.toggle('solid', !!color);
   stage.style.setProperty('--stage-color', color || 'transparent');
-  return pic && bgPic.tex ? 'picture' : color;
+  showStage();
+  return pic && bgPic.tex ? 'picture' : set && liveStage.group ? 'stage' : color;
+}
+
+// --- places -------------------------------------------------------------------------------------
+//
+// a whole place from the game around her (stage.js): a concert stage, a racecourse, Tracen, a story
+// or cut-in set... converted the first time it's picked, and again for another season, weather or
+// time of day where the place has those. the picker shows a preview of the ones already opened
+// (rendered here, saved by the server).
+
+const PLACE_KINDS = [['live', 'Concerts'], ['race', 'Racecourses'], ['home', 'Tracen'], ['set', 'Story sets'],
+                     ['cutin', 'Cut-ins'], ['gacha', 'Gacha'], ['mini', 'Chibi']];
+const CONDS = [
+  ['#placeSeason', 'Season', { 1: 'Spring', 2: 'Summer', 3: 'Autumn', 4: 'Winter', 5: 'Cherry blossom' }],
+  ['#placeWeather', 'Weather', { 1: 'Sunny', 2: 'Cloudy', 3: 'Rainy', 4: 'Snowy' }],
+  ['#placeTime', 'Time', { 1: 'Morning', 2: 'Day', 3: 'Evening', 4: 'Night' }],
+];
+// concert stages were remembered by number before there were other places
+const placeId = id => /^\d+$/.test(id) ? 'live:' + id : id;
+const liveStage = { id: placeId(store.get('stageId', '')), group: null, items: null };
+const condOf = id => store.get('placeConds', {})[id] || [0, 0, 0];
+const altOf = id => store.get('placeAlts', {})[id] || null;
+
+async function placeItems() {
+  liveStage.items ??= (await getJson('/api/stages', null)).items;
+  return liveStage.items;
+}
+
+function showStage() {
+  const on = shot.bg === 'stage' && !!liveStage.group;
+  if (liveStage.group) liveStage.group.visible = on;
+  // skies and far stands are hundreds of metres out
+  const near = on ? 0.1 : 0.03, far = on ? 3000 : 100;
+  if (camera.far !== far) { camera.near = near; camera.far = far; camera.updateProjectionMatrix(); }
+  stageShown(on);
+}
+
+async function openStage(id, cond = condOf(id), alt = altOf(id)) {
+  const item = (await placeItems()).find(it => it.id === id);
+  if (!item) throw new Error('That place is not downloaded');
+  const info = await post('/api/stage/load', { id, cond, alt }, `Building ${item.name}…`);
+  const group = await busy('Loading the place…', loadStage(info, renderer));
+  if (liveStage.group) {
+    scene.remove(liveStage.group);
+    liveStage.group.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.map?.dispose(); o.material.dispose(); } });
+  }
+  liveStage.group = group;
+  liveStage.id = id;
+  store.set('stageId', id);
+  store.set('placeConds', { ...store.get('placeConds', {}), [id]: cond });
+  store.set('placeAlts', { ...store.get('placeAlts', {}), [id]: alt });
+  scene.add(group);
+  showParts(group, stageParts());
+  stageLoaded(group, id);
+  $('#bgStageName').textContent = item.name;
+  $('#bgStageThumb').src = `/data/_stages/${item.dir}/thumb.jpg`;
+  // the season / weather / time this place comes in, the rest of the controls it has parts for
+  CONDS.forEach(([sel, any, names], i) => {
+    const el = $(sel);
+    el.innerHTML = '';
+    el.add(new Option(any, 0));
+    for (const v of item.axes[i]) el.add(new Option(names[v] || v, v));
+    el.value = cond[i];
+    el.style.display = item.axes[i].length ? '' : 'none';
+  });
+  // whole alternative versions of the place (other decorations): numbered, the game has no names
+  const alts = item.alts || [];
+  $('#placeAlt').innerHTML = '';
+  alts.forEach((a, i) => $('#placeAlt').add(new Option(`Version ${i + 1}`, a)));
+  $('#placeAlt').value = alts.includes(alt) ? alt : alts[0] || '';
+  $('#placeAlt').style.display = alts.length > 1 ? '' : 'none';
+  $('#placeConds').style.display = item.axes.some(a => a.length) || alts.length > 1 ? '' : 'none';
+  const kinds = partKinds(group);
+  $('#stageLightsRow').style.display = kinds.has('lights') ? '' : 'none';
+  $('#stageCrowdRow').style.display = kinds.has('crowd') ? '' : 'none';
+  $('#stageFxRow').style.display = kinds.has('effects') ? '' : 'none';
+  background();
+  if (!item.thumb) stageThumb(item);
+}
+CONDS.forEach(([sel]) => {
+  $(sel).onchange = () => {
+    if (!liveStage.id) return;
+    openStage(liveStage.id, CONDS.map(([s]) => +$(s).value)).catch(e => toast(e.message, true));
+  };
+});
+$('#placeAlt').onchange = () => {
+  if (liveStage.id) openStage(liveStage.id, condOf(liveStage.id), $('#placeAlt').value).catch(e => toast(e.message, true));
+};
+
+/** A small picture of the place for the picker: a stage from the crowd, anywhere else the view. */
+function stageThumb(item) {
+  const W = 320, H = 180;
+  let cam;
+  if (item.kind === 'live') {
+    cam = new THREE.PerspectiveCamera(40, W / H, 0.1, 3000);
+    cam.position.set(0, 4, 18);
+    cam.lookAt(0, 3, -2);
+  } else {
+    cam = new THREE.PerspectiveCamera(Math.max(camera.fov, 40), W / H, 0.1, 3000);
+    cam.position.copy(camera.position);
+    cam.quaternion.copy(camera.quaternion);
+  }
+  cam.updateMatrixWorld();
+  const rt = new THREE.WebGLRenderTarget(W, H, { samples: 4 });
+  props.gizmo(false);
+  stageGizmo(false);
+  pose.gizmo(false);
+  liveStage.group.visible = true;   // picked before the background switches to it
+  faceCamera(liveStage.group, cam);
+  renderer.setRenderTarget(rt);
+  renderer.setClearColor(0x000000, 1);
+  renderer.clear();
+  renderer.render(scene, cam);
+  showStage();
+  const px = new Uint8Array(W * H * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, W, H, px);
+  renderer.setRenderTarget(null);
+  renderer.setClearColor(0x000000, 0);
+  props.gizmo(true);
+  stageGizmo(true);
+  pose.gizmo(true);
+  rt.dispose();
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const img = new ImageData(W, H);
+  for (let y = 0; y < H; y++) img.data.set(px.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
+  cv.getContext('2d').putImageData(img, 0, 0);
+  post('/api/stage/thumb', { id: item.id, jpg: cv.toDataURL('image/jpeg', 0.85) }, null).then(() => {
+    item.thumb = true;
+    $('#bgStageThumb').src = `/data/_stages/${item.dir}/thumb.jpg?` + Date.now();
+  }).catch(() => {});
+}
+
+async function chooseStage() {
+  const items = await placeItems();
+  const kinds = PLACE_KINDS.filter(([k]) => items.some(it => it.kind === k));
+  let tab = store.get('placeTab', 'live');
+  if (!kinds.some(([k]) => k === tab)) tab = kinds[0]?.[0];
+  let done;
+  const picked = new Promise(r => { done = r; });
+  const fill = () => {
+    const find = $('#placeFilter').value.trim().toLowerCase();
+    radio('#placeTabs .chip', $(`#placeTabs .chip[data-kind="${tab}"]`));
+    const grid = $('#stageGrid');
+    grid.innerHTML = '';
+    // searching looks through every kind
+    for (const it of items.filter(it => find ? it.name.toLowerCase().includes(find) : it.kind === tab)) {
+      const b = document.createElement('button');
+      b.className = 'tile wide';
+      b.innerHTML = '<img alt=""><span></span>';
+      b.querySelector('span').textContent = it.name + (it.id === liveStage.id ? ' · current' : '');
+      if (it.thumb) b.querySelector('img').src = `/data/_stages/${it.dir}/thumb.jpg`;
+      b.onclick = () => done(it.id);
+      grid.appendChild(b);
+    }
+    if (!grid.children.length) {
+      grid.innerHTML = items.length ? '<div class="empty">Nothing matches.</div>'
+        : '<div class="empty">No places downloaded yet. The game fetches them as you play.</div>';
+    }
+  };
+  $('#placeTabs').innerHTML = '';
+  for (const [k, label] of kinds) {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.dataset.kind = k;
+    b.textContent = label;
+    b.onclick = () => { tab = k; store.set('placeTab', k); $('#placeFilter').value = ''; fill(); };
+    $('#placeTabs').appendChild(b);
+  }
+  $('#placeFilter').value = '';
+  $('#placeFilter').oninput = fill;
+  fill();
+  $('#stagePicker').style.display = 'block';
+  $('#stagePickerClose').onclick = () => done(null);
+  $('#stagePicker').onmousedown = e => { if (e.target.id === 'stagePicker') done(null); };
+  const id = await picked;
+  $('#stagePicker').style.display = 'none';
+  if (!id) return false;
+  await openStage(id).catch(e => { toast(e.message, true); throw e; });
+  return true;
+}
+$('#bgStageChange').onclick = () => chooseStage().catch(() => {});
+const stageParts = () => ({ lights: $('#stageLights').value / 100, crowd: $('#stageCrowd').checked, effects: $('#stageFx').checked });
+$('#stageLights').value = store.get('stageLights', 40);
+$('#stageCrowd').checked = store.get('stageCrowd', true);
+$('#stageLights').oninput = () => { store.set('stageLights', +$('#stageLights').value); if (liveStage.group) showParts(liveStage.group, stageParts()); };
+$('#stageFx').checked = store.get('stageFx', false);
+for (const [id, key] of [['#stageCrowd', 'stageCrowd'], ['#stageFx', 'stageFx']]) {
+  $(id).onchange = () => { store.set(key, $(id).checked); if (liveStage.group) showParts(liveStage.group, stageParts()); };
 }
 
 // a picture behind her: cover-fitted to the render frame, then zoomed, panned and optionally
@@ -1026,6 +1265,10 @@ function setBg(b) {
 $$('#bgs .chip').forEach(b => {
   b.onclick = async () => {
     if (b.dataset.bg === 'picture' && !bgPic.tex && !(await chooseBgPicture())) return;
+    if (b.dataset.bg === 'stage' && !liveStage.group) {
+      const ok = liveStage.id ? await openStage(liveStage.id).then(() => true, () => false) : false;
+      if (!ok && !(await chooseStage().catch(() => false))) return;
+    }
     setBg(b);
   };
 });
@@ -1113,13 +1356,16 @@ function renderFrame(w, h, ss = 1) {
   const rt = new THREE.WebGLRenderTarget(RW, RH, { samples: 4, stencilBuffer: true });
   const bg = background();
   placeBg(true);
+  faceCamera(liveStage.group, camera);
   props.gizmo(false);
+  stageGizmo(false);
   pose.gizmo(false);
   renderer.setRenderTarget(rt);
-  renderer.setClearColor(bg && bg !== 'picture' ? new THREE.Color(bg) : 0x000000, bg ? 1 : 0);
+  renderer.setClearColor(bg && bg !== 'picture' && bg !== 'stage' ? new THREE.Color(bg) : 0x000000, bg ? 1 : 0);
   renderer.clear(true, true, true);
   renderer.render(scene, camera);
   props.gizmo(true);
+  stageGizmo(true);
   pose.gizmo(true);
   const px = new Uint8Array(RW * RH * 4);
   renderer.readRenderTargetPixels(rt, 0, 0, RW, RH, px);
@@ -1244,7 +1490,7 @@ async function recordVideo() {
   try {
     // the game steps its physics at 60 Hz, each frame shows the tick nearest its time
     const springs = current.springs?.enabled ? current.springs : null;
-    const poseAt = t => { current.action.time = (start + t) % clip.duration; current.mixer.update(0); applyProcess(); applyFace(); };
+    const poseAt = t => { current.action.time = (start + t) % clip.duration; runMotion(0); applyProcess(); applyFace(); };
     let ticks = 0;
     if (springs) { springs.reset(); poseAt(0); await springs.step(); }
     for (let i = 0; i < frames; i++) {
@@ -1377,7 +1623,7 @@ async function bakeMotion(nodes) {
   const step = 1 / EXPORT_FPS;
   const keys = nodes.map(() => ({ p: [], q: [], s: [] }));
   const springs = current.springs?.enabled ? current.springs : null;
-  const poseAt = t => { current.action.time = t % clip.duration; current.mixer.update(0); applyProcess(); applyFace(); };
+  const poseAt = t => { current.action.time = t % clip.duration; runMotion(0); applyProcess(); applyFace(); };
   let ticks = 0;
   if (springs) { springs.reset(); poseAt(0); await springs.step(); }
   for (let i = 0; i < frames; i++) {
@@ -1440,7 +1686,7 @@ async function exportModel() {
       });
     }
     const clip = withMotion ? await busy('Baking the motion…', bakeMotion(nodes)) : null;
-    if (current.action) { current.action.time = keepTime; current.mixer.update(0); applyProcess(); applyFace(); }
+    if (current.action) { current.action.time = keepTime; runMotion(0); applyProcess(); applyFace(); }
     props.updateProps();
     const parents = [current.root.parent, info.group.parent];
     out.add(current.root, info.group);
@@ -1470,6 +1716,8 @@ function draw() {
   pose.updateDots();
   updateLight();
   placeBg(false);
+  faceCamera(liveStage.group, camera);
+  updateStageEdit();
   renderer.render(scene, camera);
 }
 renderer.setAnimationLoop(() => {
@@ -1480,7 +1728,7 @@ renderer.setAnimationLoop(() => {
   if (current) {
     // the motion (re-evaluated even when paused), the face, the camera after her, then the springs
     // on that pose. they keep running while paused, like in the game.
-    current.mixer.update(playing ? dt : 0);
+    runMotion(playing ? dt : 0);
     applyProcess();
     applyFace();
     current.root.updateMatrixWorld(true);
@@ -1527,6 +1775,9 @@ async function followWarmUp() {
 pose.initPose({ scene, camera, canvas, controls, onPick: () => props.propsDebug.select(null) });
 props.initProps({ scene, camera, renderer, controls, canvas, current: () => current, libraryClip,
                   idle: () => !!current && !recording && !pointerHeld });
+initStageEdit({ scene, camera, canvas, controls, place, her: () => current?.root,
+                onPick: () => props.propsDebug.select(null),
+                onReset: () => { if (liveStage.group) showParts(liveStage.group, stageParts()); } });
 
 window.studio = { scene, camera, controls, setCamera, setFace, savePNG, recordVideo, exportModel, chooseUma, get charas() { return charas; },
                   get current() { return current; }, video, shot, props: props.propsDebug, pose: pose.poseDebug, bgPic,

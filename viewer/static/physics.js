@@ -18,8 +18,9 @@ const uPos = (v, a, o) => { a[o] = -v.x; a[o + 1] = v.y; a[o + 2] = v.z; };
 const uQuat = (q, a, o) => { a[o] = q.x; a[o + 1] = -q.y; a[o + 2] = -q.z; a[o + 3] = q.w; };
 
 export class GameSprings {
-  /** The rest skeleton goes to the server once; null when the character has no springs. */
-  static async create(root, rest, pack) {
+  /** The rest skeleton goes to the server once; null when the character has no springs. `body`:
+   *  { shapes (bodyfit.js), clearance } for hair and ties to collide with, or null. */
+  static async create(root, rest, pack, body = null) {
     const list = [...rest.keys()];
     const index = new Map(list.map((o, i) => [o, i]));
     const nodes = list.map(o => {
@@ -28,7 +29,9 @@ export class GameSprings {
       uPos(p, t, 0); uQuat(q, r, 0);
       return [o.name, index.has(o.parent) ? index.get(o.parent) : -1, t, r, [s.x, s.y, s.z]];
     });
-    const info = await post('/api/spring/new', { pack, nodes }, null);
+    const u = v => { const a = []; uPos(v, a, 0); return a; };
+    const fit = body && { clearance: body.clearance, shapes: body.shapes.map(c => ({ bone: c.bone, a: u(c.a), b: u(c.b), r: c.r })) };
+    const info = await post('/api/spring/new', { pack, nodes, body: fit }, null);
     return info.bones.length ? new GameSprings(root, rest, info) : null;
   }
 

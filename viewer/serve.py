@@ -35,7 +35,7 @@ import gamepaths  # noqa: E402
 # of seconds.
 cyspring = motionnames = offline = story = umaconv = umadata = None
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 PORT = 27620
 CONFIG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "UmaStudio")   # = umadata.CONFIG
 ROOT = os.path.join(os.path.expanduser("~"), "Pictures", "UmaStudio")
@@ -49,9 +49,11 @@ ICONS = os.path.join(CACHE, "_icons")
 PROPS = os.path.join(CACHE, "_props")
 PROP_THUMBS = os.path.join(PROPS, "_thumbs")
 BGS = os.path.join(CACHE, "_bg")
+STAGES = os.path.join(CACHE, "_stages")
 STATIC = os.path.join(HERE, "static")
 CONVERTER_VERSION = "10"
 PROP_VERSION = "1"
+STAGE_VERSION = "8"
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
 SETUP = ("UmaStudio could not read the installed game's files. Check that Uma Musume is installed "
          "through Steam and has downloaded its data (start it once), or pick the game's folder.")
@@ -59,6 +61,7 @@ SETUP = ("UmaStudio could not read the installed game's files. Check that Uma Mu
 DATA = None
 _lock = threading.Lock()
 _prop_lock = threading.Lock()
+_stage_lock = threading.Lock()
 _charas = {"stamp": None, "list": None}
 _boot = {"stage": "Starting", "progress": 0.0, "done": False, "error": None}
 _booted = threading.Event()
@@ -153,12 +156,12 @@ def own_sets(manifest):
 _springs = {}
 
 
-def spring_new(pack, nodes):
+def spring_new(pack, nodes, body=None):
     base = safe_join(CACHE, pack)
     path = os.path.join(base, "physics.json") if base else None
     if not path or not os.path.exists(path):
         raise ValueError("no physics for that character")
-    sim = cyspring.Simulation(json.load(open(path, encoding="utf-8")), nodes)
+    sim = cyspring.Simulation(json.load(open(path, encoding="utf-8")), nodes, body)
     sid = uuid.uuid4().hex[:12]
     _springs[sid] = (sim, threading.Lock())
     while len(_springs) > 4:
@@ -382,6 +385,221 @@ def prop_load(name):
     grip, grip_left = grip_for(pid)
     return {"name": name, "id": pid, "base": f"/data/_props/{name}/", "meshes": info["meshes"],
             "grip": grip, "gripLeft": grip_left}
+
+
+# --- places -------------------------------------------------------------------------------------
+#
+# whole places from the game to stand her in: concert stages (3d/env/live), racecourses (race),
+# Tracen's grounds (home), story and event sets (set), skill cut-in sets (cutin), the gacha rooms
+# (gacha) and the chibi sets (mini). converted the first time one is picked; the picker shows a
+# preview once a place has been seen (the page renders it).
+#
+# a place is made of pieces, and a piece can come in variants coded season, weather, time
+# (1-5 spring summer autumn winter cherry blossom, 1-4 sunny cloudy rainy snowy, 2-4 day evening
+# night, 0 = any; e.g. the race skies 112..534, dry and wet tracks 010 / 030). one of each is
+# picked for the conditions asked for.
+
+PLACE_PIECE = re.compile(r"3d/env/(race|home|set|cutin|gacha|mini)/([a-z0-9_]+?)/(?:.*/)?(pfb_[a-z0-9_]+)")
+STAGE_NAME = re.compile(r"3d/env/live/live(\d+)/pfb_env_live\1_controller000")
+VARIANT = re.compile(r"(.+)_(\d{3})")
+# a place's main, middle or sky piece can come as whole alternatives (Tracen's hall main000 and
+# main002..007, each with its own decorations): the game shows one of them
+ALTERNATIVE = re.compile(r"(.+_(?:main|mid|sky))(\d{3})")
+# pieces every place of a kind shares: the race skies, the chibi sky
+SHARED = {"race": "race00000_9000/", "mini": "mini00000/"}
+# the glow sticks the crowd holds come from the song: Umapyoi Legend's unless it isn't there
+CYALUME = "live/cyalume/m1001/tex_live_cyalume_m1001_000"
+_places = {"stamp": None, "pieces": {}}
+
+
+def place_pieces():
+    """{(kind, place): [piece path, ...]} for everything downloaded, shared pieces included."""
+    need_data()
+    if _places["stamp"] == id(DATA.entries):
+        return _places["pieces"]
+    out, shared = {}, {k: [] for k in SHARED}
+    for n in DATA.prefix("3d/env/"):
+        m = PLACE_PIECE.fullmatch(n)
+        if not m or not DATA.entries[n].local:
+            continue
+        kind, place = m.group(1), m.group(2)
+        if kind in SHARED and SHARED[kind] in n:
+            shared[kind].append(n)
+        elif (kind == "race" and place.startswith("race0")) or (kind == "home" and not place.startswith("home")) \
+                or (kind == "set" and place == "set00000") or (kind == "mini" and place == "mini00000") or "_cutt" in n:
+            continue   # race gates and props, the jukebox, a lone prop, racecourse copies for cutscenes
+        else:
+            out.setdefault((kind, place), []).append(n)
+    for (kind, place), pieces in out.items():
+        pieces += shared.get(kind, [])
+    for n in DATA.prefix("3d/env/live/live"):
+        m = STAGE_NAME.fullmatch(n)
+        if m and DATA.entries[n].local:
+            out[("live", m.group(1))] = [n]
+    _places.update(stamp=id(DATA.entries), pieces=out)
+    return out
+
+
+def variant_axes(pieces):
+    """Which seasons, weathers and times this place has variants for."""
+    axes = [set(), set(), set()]
+    for n in pieces:
+        m = VARIANT.fullmatch(n.rsplit("/", 1)[-1])
+        if m:
+            for i, d in enumerate(m.group(2)):
+                if d != "0":
+                    axes[i].add(int(d))
+    return [sorted(a) for a in axes]
+
+
+# what "usual" means: a sunny spring day. the plain _000 pieces are often only templates the game
+# fills per condition (a set's main textures come with its _112 piece), so they don't get picked
+# over a variant that fits
+USUAL = (1, 1, 2)
+
+
+def variant_score(cond, code):
+    cond = tuple(c or u for c, u in zip(cond, USUAL))
+    return sum(2 if d == want else 0 if d == 0 else -1 for want, d in zip(cond, map(int, code)))
+
+
+def alternative_group(pieces):
+    """(piece family, its numbers sorted) for the alternatives a place has, or (None, [])."""
+    groups = {}
+    for n in pieces:
+        m = VARIANT.fullmatch(n.rsplit("/", 1)[-1])
+        a = ALTERNATIVE.fullmatch(m.group(1) if m else n.rsplit("/", 1)[-1])
+        if a:
+            groups.setdefault(a.group(1), set()).add(a.group(2))
+    return next(((k, sorted(v)) for k, v in sorted(groups.items()) if len(v) > 1), (None, []))
+
+
+def alternatives(pieces):
+    return alternative_group(pieces)[1]
+
+
+def pick_variants(pieces, cond, alt=None):
+    """One variant per piece for cond (season, weather, time; 0 = usual), and of a place's
+    alternatives only alt (the first when not given)."""
+    def score(code):
+        return variant_score(cond, code)
+    family, alts = alternative_group(pieces)
+    keep = alt if alt in alts else (alts[0] if alts else None)
+    families = {}
+    for n in pieces:
+        leaf = n.rsplit("/", 1)[-1]
+        m = VARIANT.fullmatch(leaf)
+        a = ALTERNATIVE.fullmatch(m.group(1) if m else leaf)
+        if a and a.group(1) == family and a.group(2) != keep:
+            continue
+        m = VARIANT.fullmatch(n.rsplit("/", 1)[-1])
+        families.setdefault(m.group(1) if m else n, []).append((m.group(2) if m else None, n))
+    out = []
+    for options in families.values():
+        if options[0][0] is None:
+            out += [n for _, n in options]
+        else:
+            out.append(max(sorted(options), key=lambda o: score(o[0]))[1])
+    return out
+
+
+TEX_VARIANT = re.compile(r"(tex_.*?_)(\d{3})(_.+)")
+
+
+def pick_textures(kind, place, cond):
+    """The game also swaps textures by condition at runtime (a racecourse's turf goes brown in
+    winter, white under snow), and fills some materials that ship without one (a racecourse's
+    turf, dirt and rails): {texture name: the one to use instead}, {(name head, tail): the one
+    to use} and the paths to pack."""
+    families = {}
+    for n in DATA.prefix(f"3d/env/{kind}/{place}/"):
+        m = TEX_VARIANT.fullmatch(n.rsplit("/", 1)[-1])
+        if m and "/textures/" in n and DATA.entries[n].local:
+            families.setdefault((m.group(1), m.group(3)), []).append((m.group(2), n))
+    swap, fill, paths = {}, {}, []
+    for (head, tail), options in families.items():
+        best = max(sorted(options), key=lambda o: variant_score(cond, o[0]))
+        paths.append(best[1])
+        fill[head + "|" + tail] = head + best[0] + tail
+        for code, _ in options:
+            if code != best[0]:
+                swap[head + code + tail] = head + best[0] + tail
+    return swap, fill, paths
+
+
+def _texts(cat):
+    import sqlite3
+    try:
+        db = sqlite3.connect(f"file:{gamepaths.master()}?mode=ro", uri=True)
+        return dict(db.execute("SELECT [index], text FROM text_data WHERE category = ?", (cat,)))
+    except Exception:
+        return {}
+
+
+def place_name(kind, place, courses, charas):
+    num = re.search(r"\d+", place)
+    n = int(num.group()) if num else 0
+    if kind == "live":
+        return f"Stage {place}"
+    if kind == "race":
+        return courses.get(n) or f"Racecourse {n}"
+    if kind == "home":
+        return "Tracen Academy" if n == 10001 else f"Tracen {n}"
+    if kind == "cutin":
+        cid, _, v = place[len("cutin"):].partition("_")
+        return f"{charas.get(int(cid), 'Cut-in ' + cid)} · {v}"
+    if kind == "gacha":
+        return {"gacha_chara00": "Gacha: Umamusume", "gacha_support_card00": "Gacha: support cards"}.get(place, place)
+    return f"{'Chibi set' if kind == 'mini' else 'Set'} {n}"
+
+
+def place_dir(pid, cond, alt=None):
+    return pid.replace(":", "_") + ("" if not any(cond) else "_" + "".join(map(str, cond))) + (f"_v{alt}" if alt else "")
+
+
+def place_list():
+    courses, charas = _texts(34), _texts(6)
+    out = []
+    for (kind, place), pieces in sorted(place_pieces().items()):
+        pid = f"{kind}:{place}"
+        out.append({"id": pid, "kind": kind, "name": place_name(kind, place, courses, charas),
+                    "axes": variant_axes(pieces), "alts": alternatives(pieces), "dir": place_dir(pid, (0, 0, 0)),
+                    "thumb": os.path.exists(os.path.join(STAGES, place_dir(pid, (0, 0, 0)), "thumb.jpg"))})
+    return out
+
+
+def place_load(pid, cond=(0, 0, 0), alt=None):
+    """Convert (once) and hand out a place. pid: kind:place, e.g. live:10101, race:race10006."""
+    if ":" not in pid:
+        pid = "live:" + pid   # stages picked before there were other places
+    kind, _, place = pid.partition(":")
+    pieces = place_pieces().get((kind, place))
+    if not pieces:
+        raise ValueError("no such place: " + pid)
+    cond = tuple(int(c) for c in cond)
+    alts = alternatives(pieces)
+    alt = alt if alt in alts[1:] else None   # the first one is the plain folder
+    folder = place_dir(pid, cond, alt)
+    dst = os.path.join(STAGES, folder)
+    stamp = os.path.join(dst, "version.txt")
+    with _stage_lock:
+        if not (os.path.exists(stamp) and open(stamp).read() == STAGE_VERSION):
+            files = []
+            for n in pick_variants(pieces, cond, alt):
+                files += DATA.export(n, BUNDLES)
+            swap, fill, textures = pick_textures(kind, place, cond) if kind != "live" else ({}, {}, [])
+            for n in textures:
+                files += DATA.export(n, BUNDLES, deps=False)
+            if kind == "live":
+                sticks = CYALUME if CYALUME in DATA.entries and DATA.entries[CYALUME].local else next(
+                    (n for n in DATA.prefix("live/cyalume/") if DATA.entries[n].local), None)
+                if sticks:
+                    files += DATA.export(sticks, BUNDLES, deps=False)
+            umaconv.convert_stage(sorted(set(files)), dst, swap, fill)
+            with open(stamp, "w") as f:
+                f.write(STAGE_VERSION)
+    return {"id": pid, "dir": folder, "base": f"/data/_stages/{folder}/",
+            "thumb": os.path.exists(os.path.join(dst, "thumb.jpg"))}
 
 
 # --- backgrounds --------------------------------------------------------------------------------
@@ -781,6 +999,8 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/prop/thumb/(pfb_chr_prop\d+_\d+)$", p)
             if m:
                 return self._file(os.path.join(PROP_THUMBS, m.group(1) + ".png"), cache=True)
+            if p == "/api/stages":
+                return self._send(200, {"ok": True, "items": place_list()})
             if p == "/api/bgs":
                 return self._send(200, {"ok": True, "items": bg_list()})
             m = re.match(r"^/api/bg/(thumb/)?([a-z0-9_]+)\.(png|jpg)$", p)
@@ -834,7 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
                 manifest = convert(name)
                 return self._send(200, {"ok": True, "pack": name, "manifest": manifest, "sets": own_sets(manifest)})
             if self.path == "/api/spring/new":
-                return self._send(200, {"ok": True, **spring_new(body.get("pack", ""), body["nodes"])})
+                return self._send(200, {"ok": True, **spring_new(body.get("pack", ""), body["nodes"], body.get("body"))})
             if self.path == "/api/render":
                 os.makedirs(RENDERS, exist_ok=True)
                 name = re.sub(r"[^\w\-. ]", "_", body.get("name", "render"))[:120] or "render"
@@ -847,6 +1067,18 @@ class Handler(BaseHTTPRequestHandler):
                 with open(path, "wb") as f:
                     f.write(data)
                 return self._send(200, {"ok": True, "path": path})
+            if self.path == "/api/stage/load":
+                return self._send(200, {"ok": True, **place_load(str(body.get("id", "")), body.get("cond") or (0, 0, 0), body.get("alt"))})
+            if self.path == "/api/stage/thumb":
+                # one preview per place, whatever season or time it was seen in
+                pid = str(body.get("id", ""))
+                if (pid.split(":")[0], pid.partition(":")[2]) not in place_pieces():
+                    return self._send(400, {"error": "bad place"})
+                folder = os.path.join(STAGES, place_dir(pid, (0, 0, 0)))
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, "thumb.jpg"), "wb") as f:
+                    f.write(base64.b64decode(body.get("jpg", "").split(",", 1)[-1]))
+                return self._send(200, {"ok": True})
             if self.path == "/api/prop/load":
                 return self._send(200, {"ok": True, **prop_load(body.get("name", ""))})
             if self.path == "/api/prop/thumb":
@@ -876,8 +1108,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
 
+def running_version(url):
+    """The version of the UmaStudio already on this address, None when it is something else."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url + "api/status", timeout=5) as r:
+            return json.loads(r.read()).get("version") or None
+    except Exception:
+        return None
+
+
+def tell(msg, app):
+    print(msg, flush=True)
+    if app and sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, "UmaStudio", 0x30)   # MB_ICONWARNING
+
+
 def main():
-    app = ("--app" in sys.argv or getattr(sys, "frozen", False)) and "--no-browser" not in sys.argv
+    app =("--app" in sys.argv or getattr(sys, "frozen", False)) and "--no-browser" not in sys.argv
     if sys.stdout is None:   # pythonw / the exe: no console, so keep a log instead
         os.makedirs(CONFIG, exist_ok=True)
         sys.stdout = sys.stderr = open(os.path.join(CONFIG, "viewer.log"), "a", encoding="utf-8", buffering=1)
@@ -887,15 +1136,28 @@ def main():
     # thumbnails, frames and model files arrive in bursts, the default backlog of 5 can drop
     # connections while the GIL is busy decoding.
     ThreadingHTTPServer.request_queue_size = 64
+    # windows lets a second SO_REUSEADDR socket onto a port that's in use, and the first one keeps
+    # getting the requests: a second copy would start up and quietly talk to the first
+    ThreadingHTTPServer.allow_reuse_address = sys.platform != "win32"
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
-        # already running: open another window onto it
-        if app:
-            native_window(url) or open_window(url)
-        else:
-            webbrowser.open(url)
-        return
+        other = running_version(url)
+        if other == VERSION:
+            # already running: open another window onto it
+            if app:
+                native_window(url) or open_window(url)
+            else:
+                webbrowser.open(url)
+            return
+        if other:
+            # another version (an old copy still open after an update) would show its own page here
+            tell(f"UmaStudio {other} is still running. Close it, or end UmaStudio.exe in Task Manager, "
+                 f"then start {VERSION} again.", app)
+            return
+        # something else has the port, so a free one
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        url = f"http://127.0.0.1:{server.server_port}/"
     print(f"UmaStudio viewer on {url}", flush=True)
     threading.Thread(target=boot, daemon=True).start()
     if not app:

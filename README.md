@@ -35,11 +35,15 @@ the first time you open her, after that she loads from the cache.
   motion, so pictures, videos and exports keep them. Poses can be saved and loaded.
 - **Props**: one of the game's hand props, or your own picture as a card or a box. A picture can
   also go on a game prop. Drag the handles in the view to place it.
-- **Render**: lens, background (transparent, color, a game background or your own picture),
-  PNG size (presets or your own), video (MP4, transparent WebM, MOV for editing, transparent GIF,
+- **Render**: lens, background (transparent, color, a game background, your own picture, or a
+  3D **Place**: concert stages, racecourses, Tracen, story, cut-in and gacha sets, with season,
+  weather and time of day where the game has them), PNG size (presets or your own), video (MP4, transparent WebM, MOV for editing, transparent GIF,
   or numbered PNG frames), and **Export for Blender**: her mesh, skeleton, textures and props as
   a .glb, in the current pose or with the motion baked in.
-- **Look**: light, shadow size, outlines, hair and cloth physics.
+- **Look**: light, shadow size, outlines, hair and cloth physics with body collisions.
+
+**Edit the place** (under Place) lets you move, turn, resize or hide its parts, from a list or by
+clicking them in the view, and stand her somewhere else on it. Changes are kept per place.
 
 Mouse: left drag turns the camera, right drag pans, wheel zooms.
 Keys: Space plays/pauses, W / E / R switch the prop handles, Delete removes a prop, Esc lets go,

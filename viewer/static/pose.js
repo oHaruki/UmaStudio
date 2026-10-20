@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
-import { $, store, toast, typing } from '/static/ui.js';
+import { $, store, toast, typing, endDragOnRelease } from '/static/ui.js';
 
 // pose mode: turn joints by hand on top of whatever the motion does. an edit is a rotation offset
 // per bone, applied right after the motion poses the skeleton (applyEdits), so physics, the head
@@ -13,7 +13,7 @@ const BODY = ['Hip', 'Waist', 'Spine', 'Chest', 'Neck', 'Head',
 const FINGERS = SIDES.flatMap(s => ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky'].flatMap(f => [1, 2, 3].map(i => `${f}_0${i}_${s}`)));
 
 const edits = new Map();          // bone name -> offset quaternion, local, after the motion
-const animQ = new Map();          // bone name -> what the motion set this frame (before the offset)
+const under = new Map();          // bone -> { base: what the motion set this frame, put: base + offset }
 const undoStack = [];
 let ctx = null, cur = null, tc = null, proxy = null;
 let showing = false, fingers = false, selected = null;
@@ -46,14 +46,22 @@ function rebuildDots() {
 /** Every frame, right after the motion: the offsets on top of it. */
 export function applyEdits() {
   if (!cur) return;
-  animQ.clear();
   for (const [name, off] of edits) {
     const b = cur.root.getObjectByName(name);
     if (!b) continue;
-    animQ.set(name, b.quaternion.clone());
+    const base = b.quaternion.clone();
     b.quaternion.multiply(off);
+    under.set(b, { base, put: b.quaternion.clone() });
   }
-  if (selected && !animQ.has(selected.name)) animQ.set(selected.name, selected.quaternion.clone());
+  if (selected && !under.has(selected)) under.set(selected, { base: selected.quaternion.clone(), put: selected.quaternion.clone() });
+}
+
+/** Right before the motion runs again: the offsets come off. the motion only rewrites bones it
+ *  has tracks for (never the ears, nothing in the rest pose), so the others would stack another
+ *  offset every frame. a bone something else has set since (rest pose, a grip) keeps that. */
+export function liftEdits() {
+  for (const [b, u] of under) if (b.quaternion.equals(u.put)) b.quaternion.copy(u.base);
+  under.clear();
 }
 
 /** Every frame before drawing: dots on the joints at a steady size, the proxy on the picked bone. */
@@ -109,7 +117,7 @@ function refreshCount() {
 // while dragging: the offset that makes the bone match the proxy, given what the motion set
 function fromProxy() {
   if (!selected) return;
-  const base = animQ.get(selected.name) || selected.quaternion;
+  const base = under.get(selected)?.base || selected.quaternion;
   selected.parent.getWorldQuaternion(_q).invert().multiply(proxy.quaternion);   // wanted local rotation
   edits.set(selected.name, base.clone().invert().multiply(_q));
   refreshCount();
@@ -117,6 +125,7 @@ function fromProxy() {
 
 /** A new character: same bone names, so the edits carry over. */
 export function onModel(c) {
+  under.clear();
   cur = c;
   select(null);
   rebuildDots();
@@ -170,9 +179,12 @@ export function initPose(c) {
     if (e.value) remember();
   });
   tc.addEventListener('objectChange', fromProxy);
+  endDragOnRelease(tc);
   ctx.scene.add(tc);
 
-  // click a dot to pick its joint; this runs before the props' own click handling
+  // click a dot to pick its joint; this runs before the props' own click handling, which skips
+  // a click taken here. only marked, never stopped: the orbit and both gizmos need the pointerup
+  // to end their own drag, or the camera keeps turning with the mouse
   let down = null;
   ctx.canvas.addEventListener('pointerdown', e => { down = [e.clientX, e.clientY]; }, true);
   ctx.canvas.addEventListener('pointerup', e => {
@@ -189,7 +201,7 @@ export function initPose(c) {
       if (dd < bestD) { bestD = dd; best = d.userData.bone; }
     }
     if (best) {
-      e.stopImmediatePropagation();
+      e.preventDefault();
       select(best);
     } else if (selected && tc.axis === null) select(null);
   }, true);
