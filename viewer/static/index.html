@@ -100,6 +100,13 @@ header { grid-column: 1 / 4; display: flex; align-items: center; gap: 8px; paddi
 #umaBtn { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px 0 2px; background: var(--field); border: 1px solid var(--edge);
   border-radius: var(--r); cursor: pointer; text-align: left; min-width: 200px; }
 #umaBtn:hover { border-color: #555; }
+#cast { display: flex; gap: 3px; margin-left: 6px; }
+.castChip { display: flex; align-items: center; gap: 5px; height: 28px; padding: 0 4px 0 2px; background: var(--field); border: 1px solid var(--edge);
+  border-radius: var(--r); color: var(--text); cursor: pointer; }
+.castChip img { width: 22px; height: 22px; border-radius: 3px; object-fit: contain; }
+.castChip.on { border-color: var(--sel); background: var(--sel-row); }
+.castChip i { font-style: normal; color: var(--dim); padding: 0 3px; }
+.castChip i:hover { color: #fff; }
 #umaBtn img { width: 26px; height: 26px; border-radius: 3px; background: #333; object-fit: contain; }
 #umaBtn b { display: block; font-weight: 500; line-height: 1.15; }
 #umaBtn small { display: block; color: var(--dim); font-size: 11px; line-height: 1.15; }
@@ -150,11 +157,20 @@ canvas#view { width: 100%; height: 100%; display: block; outline: none; }
 #player { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 8px; background: var(--head); flex: none; }
 #play { width: 28px; height: var(--h); border-radius: var(--r); border: 1px solid var(--edge); background: var(--widget); cursor: pointer; font-size: 10px; flex: none; }
 #play:hover { background: var(--widget-hi); }
+#scrubWrap { position: relative; flex: 1; display: flex; min-width: 0; }
+#keyMarks { position: absolute; left: 2px; right: 2px; bottom: 2px; height: 8px; pointer-events: none; }
+#keyMarks i { position: absolute; bottom: 0; width: 1px; height: 5px; background: #8a8a8a; }
+#keyMarks i.mine { width: 7px; height: 7px; margin-left: -3px; bottom: 1px; background: #e8b04a; transform: rotate(45deg);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.5); pointer-events: auto; cursor: pointer; }
+#animPresets { --cols: 5; }
 #scrub { -webkit-appearance: none; appearance: none; flex: 1; height: var(--h); margin: 0; border-radius: var(--r); cursor: pointer;
   background: repeating-linear-gradient(90deg, #3a3a3a 0 1px, transparent 1px 24px), var(--field); border: 1px solid var(--edge); }
 #scrub::-webkit-slider-thumb { -webkit-appearance: none; width: 3px; height: 20px; background: var(--sel); border-radius: 1px; box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
 #time { font-variant-numeric: tabular-nums; color: var(--text); width: 52px; text-align: right; }
 #speed { width: 64px; }
+#playKey, #playMotion { flex: none; }
+#keyMarks i.mot { width: 7px; height: 7px; margin-left: -3px; bottom: -3px; border-radius: 50%; background: #6fb3ff;
+  box-shadow: 0 0 0 1px rgba(0,0,0,.5); pointer-events: auto; cursor: pointer; }
 #follow { width: 118px; flex: none; }
 
 /* --- sidebar: pages with tabs on the outer edge -------------------------------------------- */
@@ -187,8 +203,8 @@ details.panel[open] > summary::before { transform: rotate(90deg); }
 #gizmoModes { --cols: 4; }
 #stageModes, #stageActs, #stageMore { --cols: 3; }
 #placeTabs { --cols: 7; margin-bottom: 8px; }
-#placeConds { gap: 4px; }
-#placeConds select { min-width: 0; }
+#placeConds, #extraConds { gap: 4px; }
+#placeConds select, #extraConds select { min-width: 0; }
 #stageTree { max-height: 260px; overflow-y: auto; border-radius: var(--r); }
 #stageTree .row:nth-child(odd) { background-color: var(--row); }
 #stageTree .row:nth-child(even) { background-color: var(--row-alt); }
@@ -286,6 +302,8 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
   </div>
   <button id="umaBtn" title="Choose an Uma"><img id="umaImg" alt=""><div><b id="umaName">Choose an Uma</b><small id="umaOutfit">click to pick</small></div></button>
   <select id="outfit" class="pill" title="Outfit"></select>
+  <div id="cast" style="display:none"></div>
+  <button id="castAdd" class="b" title="Another Uma in the scene, next to her">+ Uma</button>
 </header>
 
 <aside class="area">
@@ -293,6 +311,7 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
     <select id="poseCat" class="field" title="Which poses to list"></select>
     <input type="search" id="poseFilter" placeholder="Search" title="Search poses (English words work: arms crossed, waving…)">
     <label class="toggle" title="List mirrored versions too"><input type="checkbox" id="libMirror">Mirror</label>
+    <button class="b" id="animImport" style="display:none" title="Animations from Mixamo, Quaternius or any humanoid .glb, put on her">Import…</button>
   </div>
   <div id="poses"></div>
 </aside>
@@ -339,7 +358,12 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
   <div id="player">
     <button id="play" title="Play / pause (space)">▶</button>
     <span id="time">0.00s</span>
-    <input type="range" id="scrub" min="0" max="1" step="0.001" value="0" title="Pause anywhere: that frame is your pose">
+    <div id="scrubWrap">
+      <input type="range" id="scrub" min="0" max="1" step="0.001" value="0" title="Pause anywhere: that frame is your pose">
+      <div id="keyMarks"></div>
+    </div>
+    <button id="playKey" class="b" title="K: key what's picked at this moment">◆ Key</button>
+    <button id="playMotion" class="b" title="From this moment she plays the pose she has now">● Motion</button>
     <select id="speed" class="field" title="Speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>
   </div>
 </main>
@@ -405,10 +429,12 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
             <button class="chip" id="addProp" title="One of the game's hand props">Game prop</button>
             <button class="chip" id="addCard" title="Your picture as a flat card">Picture card</button>
             <button class="chip" id="addBox" title="Your picture on every side of a box">Picture box</button>
+            <button class="chip" id="addModel" title="A .glb model from anywhere (Sketchfab, Blender...)">3D model</button>
           </div>
           <div class="hint" id="propHint">Give her something to hold. Dropping or pasting a picture adds it as a card.</div>
           <div id="propList"></div>
           <div id="propEdit" style="display:none">
+            <label class="prop" id="propOwnerRow" style="display:none"><span>Held by</span><select id="propOwner" class="field"></select></label>
             <label class="prop"><span>Hold in</span>
               <select id="propAnchor" class="field">
                 <option value="right">Right hand</option><option value="left">Left hand</option><option value="both">Both hands</option>
@@ -431,6 +457,7 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
             </div>
             <label class="check" id="propGripRow"><input type="checkbox" id="propGrip" checked> Close her hand around it</label>
             <label class="check" id="propToonRow"><input type="checkbox" id="propToon" checked> Toon shading</label>
+            <label class="prop" id="propClipRow"><span>Animation</span><select id="propClip" class="field" title="The model's own animation, played along the timeline"></select></label>
             <div class="seg" id="gizmoModes">
               <button class="chip on" data-mode="translate" title="W">Move</button>
               <button class="chip" data-mode="rotate" title="E">Rotate</button>
@@ -498,11 +525,58 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
                 <button class="chip" id="stageUnhide">Show hidden</button>
                 <button class="chip" id="stageResetAll" title="Every change to this place undone">Reset place</button>
               </div>
+              <button class="b" id="stageAddPlace" title="Bring in another place (or the same one in another season) to build with: it comes in as one group you can move, and its parts can be moved like this place's">Add another place…</button>
+              <div class="line" id="extraConds" style="display:none">
+                <select class="field grow" title="Season of the added place"></select>
+                <select class="field grow" title="Weather of the added place"></select>
+                <select class="field grow" title="Time of day of the added place"></select>
+                <select class="field grow" title="Version of the added place"></select>
+              </div>
               <input type="search" id="stageFind" class="field" placeholder="Find a part">
               <div id="stageTree"></div>
               <div class="hint">Pick a part in the list or click it in the view: what a click would take is outlined, clicking the same spot again takes the next thing behind it. W / E / R switch handles, Delete hides, Esc lets go. Kept per place.</div>
             </div>
           </div>
+        </div>
+      </details>
+      <details class="panel" id="pnlAnim">
+        <summary>Animation</summary>
+        <div class="body">
+          <div class="seg" id="animModes">
+            <button class="chip on" data-mode="picked" title="Whatever is picked in the place editor or the props">Picked</button>
+            <button class="chip" data-mode="her" title="Her spot: walk her across the place">Her</button>
+            <button class="chip" data-mode="camera" title="The view as it is now">Camera</button>
+          </div>
+          <div class="prop"><span>Keying</span><span class="val" id="animTarget">nothing picked</span></div>
+          <div class="prop"><span>Has</span><span class="val" id="animCount">no keys</span></div>
+          <div class="seg">
+            <button class="chip" id="animKey" title="K: keep it as it is now, at this moment on the timeline">Key</button>
+            <button class="chip" id="animDel" title="Take away its key at this moment">Delete key</button>
+            <button class="chip" id="animClear" title="Every key of this one">Clear its keys</button>
+          </div>
+          <div class="prop"><span id="animMotionWho">Her motion</span><span class="val" id="animMotionCount">no keys</span></div>
+          <div class="seg">
+            <button class="chip" id="animMotionKey" title="From this moment on she plays the pose she has now (picking a pose later keys it too)">Key her pose</button>
+            <button class="chip" id="animMotionDel" title="Take away her motion key at this moment">Delete</button>
+          </div>
+          <button class="b" id="animFaceKey" title="From this moment on she has the face you picked last (picking a face later keys it too)">Key her face</button>
+          <label class="prop"><span>Getting there</span>
+            <select id="animEase" class="field" title="How it moves from the key before to a new key">
+              <option value="smooth">Smooth</option><option value="linear">Steady</option><option value="out">Fast, then slow</option>
+              <option value="in">Slow, then fast</option><option value="back">Overshoot</option><option value="bounce">Bounce</option>
+              <option value="step">Jump</option>
+            </select>
+          </label>
+          <div class="seg" id="animPresets">
+            <button class="chip" data-preset="pop" title="Grows out of nothing here, now">Pop in</button>
+            <button class="chip" data-preset="drop" title="Falls in from above and bounces">Drop in</button>
+            <button class="chip" data-preset="slide" title="Slides in from the left of the view">Slide in</button>
+            <button class="chip" data-preset="out" title="Shrinks away">Pop out</button>
+            <button class="chip" data-preset="wobble" title="A shake, as if hit">Wobble</button>
+          </div>
+          <label class="num"><input type="range" id="animLen" min="1" max="120" step="0.5" value="10" data-unit=" s"><span class="k">Length</span><output></output></label>
+          <button class="b" id="animClearAll">Clear everything</button>
+          <div class="hint">Put something where it should be, move the timeline, press Key (K). In between it moves on its own. The presets start at the timeline's moment and end where the thing is now. With keys the timeline is the scene's: her motion loops along and a video records all of it.</div>
         </div>
       </details>
       <details class="panel" id="pnlImage" open>
@@ -550,6 +624,14 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
           <button class="b" id="openRenders">Open saved files</button>
         </div>
       </details>
+      <details class="panel" id="pnlBlender" open>
+        <summary>Blender</summary>
+        <div class="body">
+          <button class="b" id="exportBlender" title="The whole scene over the timeline, with toon shading, shadows, depth of field and glow set up in Blender">Send to Blender</button>
+          <label class="check"><input type="checkbox" id="blenderRender" checked> Render it right away</label>
+          <div class="hint">Saved in Pictures\UmaStudio\blender with a .blend to tweak by hand. Needs Blender 4.2 or newer installed.</div>
+        </div>
+      </details>
       <details class="panel" id="pnlModel" open>
         <summary>Model</summary>
         <div class="body">
@@ -580,6 +662,20 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
           <label class="num" title="Extra room between the body and the hair resting on it"><input type="range" id="bodyGap" min="0" max="20" step="1" value="0" data-unit=" mm"><span class="k">Body clearance</span><output></output></label>
           <label class="check"><input type="checkbox" id="outline" checked> Outlines</label>
           <label class="num"><input type="range" id="outlineW" min="0" max="3" step="0.05" value="1" data-unit="×"><span class="k">Outline width</span><output></output></label>
+        </div>
+      </details>
+      <details class="panel" id="pnlFinish" open>
+        <summary>Finish</summary>
+        <div class="body">
+          <label class="check" title="Over the whole picture when the background is solid: lines on the place and props too, glow, colour, vignette"><input type="checkbox" id="postOn" checked> Finishing pass</label>
+          <label class="num" title="Dark lines where something stands in front of something far behind it"><input type="range" id="postLines" min="0" max="1" step="0.05" value="0.8"><span class="k">Lines</span><output></output></label>
+          <label class="num" title="Further away than this, no lines (the crowd would turn to scribbles)"><input type="range" id="postLineDist" min="5" max="200" step="5" value="40" data-unit=" m"><span class="k">Lines up to</span><output></output></label>
+          <label class="num"><input type="range" id="postBloom" min="0" max="1.5" step="0.05" value="0.2"><span class="k">Glow</span><output></output></label>
+          <label class="num"><input type="range" id="postSat" min="0.5" max="1.6" step="0.01" value="1.12" data-unit="×"><span class="k">Colour</span><output></output></label>
+          <label class="num"><input type="range" id="postContrast" min="0.7" max="1.4" step="0.01" value="1.06" data-unit="×"><span class="k">Contrast</span><output></output></label>
+          <label class="num"><input type="range" id="postWarm" min="-1" max="1" step="0.05" value="0.3"><span class="k">Warmth</span><output></output></label>
+          <label class="num"><input type="range" id="postVignette" min="0" max="1" step="0.05" value="0.35"><span class="k">Vignette</span><output></output></label>
+          <button class="b" id="postReset">Back to the usual</button>
         </div>
       </details>
     </div>
@@ -618,8 +714,14 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
   <div class="foot hint">The game's hand props.</div>
 </div></div>
 
+<div id="modelPicker" class="modal"><div class="box">
+  <div class="top"><h2>Your models</h2><button class="b" id="modelImport">Import .glb…</button><button class="b" id="modelFolder">Open folder</button><button class="b close" id="modelClose">Close</button></div>
+  <div id="modelGrid" class="grid"></div>
+  <div class="foot hint">.glb files (glTF binary) from Sketchfab, Blender or anywhere. Drop them on this window too. They are kept in Pictures\UmaStudio\models.</div>
+</div></div>
+
 <div id="stagePicker" class="modal"><div class="box">
-  <div class="top"><h2>Choose a place</h2><input type="search" id="placeFilter" placeholder="Search"><button class="b close" id="stagePickerClose">Close</button></div>
+  <div class="top"><h2 id="stagePickerTitle">Choose a place</h2><input type="search" id="placeFilter" placeholder="Search"><button class="b close" id="stagePickerClose">Close</button></div>
   <div class="seg" id="placeTabs"></div>
   <div id="stageGrid" class="grid"></div>
   <div class="foot hint">Places from the game you have downloaded. One gets a preview here once you have opened it.</div>
@@ -641,6 +743,8 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
   <div class="foot hint">Drop pictures anywhere on this window or paste one with Ctrl+V. They are kept in Pictures\UmaStudio\images.</div>
 </div></div>
 <input type="file" id="imgFile" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+<input type="file" id="modelFile" accept=".glb,model/gltf-binary" multiple hidden>
+<input type="file" id="animFile" accept=".glb,model/gltf-binary" multiple hidden>
 
 <script type="module" src="/static/viewer.js"></script>
 </body>

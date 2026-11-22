@@ -5,12 +5,15 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { GameSprings, TICK } from '/static/physics.js';
 import { fitBody } from '/static/bodyfit.js';
 import { loadStage, showParts, faceCamera, partKinds } from '/static/stage.js';
-import { initStageEdit, stageLoaded, stageShown, updateStageEdit, stageGizmo } from '/static/stagedit.js';
+import { initStageEdit, stageLoaded, stageShown, updateStageEdit, stageGizmo, stagePicked, partLabel, placeCast } from '/static/stagedit.js';
 import { U, kindOf, makeMaterial, makeOutline } from '/static/look.js';
 import { $, $$, call, post, getJson, toast, radio, store, busy, initChrome } from '/static/ui.js';
 import { pickImage, pictureName } from '/static/images.js';
 import * as props from '/static/props.js';
 import * as pose from '/static/pose.js';
+import * as anim from '/static/anim.js';
+import { loadSource, retarget } from '/static/retarget.js';
+import { makeChain, settings as finish } from '/static/post.js';
 
 // --- renderer -----------------------------------------------------------------
 
@@ -24,10 +27,18 @@ renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
 const scene = new THREE.Scene();
-// she hangs under this: on a stage it stands her where she was put (stagedit.js), else the origin
-const place = new THREE.Group();
+// she hangs under this: on a stage it stands her where she was put (stagedit.js), else the origin.
+// every uma in the scene has her own; this is the active one's
+let place = new THREE.Group();
 place.name = 'placement';
 scene.add(place);
+function newSpot(n) {
+  const g = new THREE.Group();
+  g.name = 'placement';
+  g.position.x = 0.8 * n;   // next to the others, not inside them
+  scene.add(g);
+  return g;
+}
 const camera = new THREE.PerspectiveCamera(25, 1, 0.03, 100);
 camera.position.set(0, 0.9, 4.2);
 const controls = new OrbitControls(camera, canvas);
@@ -90,9 +101,18 @@ async function start() {
   charas = (await getJson('/api/charas')).charas;
   fillUmas();
   const last = store.get('last', null);
-  const c = charas.find(x => x.id === (+new URLSearchParams(location.search).get('uma') || (last && last.chara)));
-  if (c) await chooseUma(c, last && last.chara === c.id ? last.dress : null);
-  else openPicker();
+  const saved = store.get('cast', []);
+  const first = saved[0] || (last && { key: 'main', chara: last.chara, dress: last.dress });
+  const c = charas.find(x => x.id === (+new URLSearchParams(location.search).get('uma') || first?.chara));
+  if (c) {
+    await chooseUma(c, first && first.chara === c.id ? first.dress : null, first?.key || 'main');
+    // the rest of the scene's umas
+    for (const s of saved.slice(1)) {
+      const cc = charas.find(x => x.id === s.chara);
+      if (cc) await chooseUma(cc, s.dress, s.key).catch(() => {});
+    }
+    if (cast.length > 1) setActive(cast[0]);
+  } else openPicker();
 }
 
 // game files not found: the user points at the install or data folder by hand
@@ -122,7 +142,8 @@ function openPicker() {
   fillUmas();
   setTimeout(() => $('#umaFilter').focus(), 30);
 }
-function closePicker() { $('#picker').style.display = 'none'; }
+function closePicker() { $('#picker').style.display = 'none'; pickerAdd = false; }
+let pickerAdd = false;   // the picker adds an uma to the scene instead of swapping the active one
 $('#umaBtn').onclick = openPicker;
 $('#pickerClose').onclick = closePicker;
 $('#picker').addEventListener('mousedown', e => { if (e.target.id === 'picker' && current) closePicker(); });
@@ -146,15 +167,25 @@ function fillUmas() {
     b.className = 'uma' + (current && current.chara === c.id ? ' on' : '');
     b.innerHTML = `<img loading="lazy" alt="" src="/api/icon/${c.base || c.id}"><span>${c.name}</span>`;
     b.querySelector('img').onerror = e => { e.target.style.visibility = 'hidden'; };
-    b.onclick = () => { closePicker(); chooseUma(c); };
+    b.onclick = () => {
+      const add = pickerAdd;
+      closePicker();
+      chooseUma(c, null, add ? 'u' + Date.now().toString(36) : undefined);
+    };
     box.appendChild(b);
   }
 }
 $('#umaFilter').oninput = fillUmas;
 $('#umaFilter').onkeydown = e => { if (e.key === 'Enter') $('#umaGrid .uma')?.click(); };
 
-async function chooseUma(c, dressId) {
+async function chooseUma(c, dressId, key = active?.key || 'main') {
   closePicker();
+  const d = umaHeader(c, dressId);
+  await openUma(c, d, key);
+}
+
+/** The header shows c in outfit dressId (or her first); returns the outfit. */
+function umaHeader(c, dressId) {
   const sel = $('#outfit');
   sel.length = 0;
   const own = c.dresses.filter(d => d.own), shared = c.dresses.filter(d => !d.own);
@@ -171,12 +202,13 @@ async function chooseUma(c, dressId) {
   sel.onchange = () => openUma(c, c.dresses.find(x => String(x.id) === sel.value));
   $('#umaImg').src = `/api/icon/${c.base || c.id}`;
   $('#umaName').textContent = c.name;
-  await openUma(c, d);
+  $('#umaOutfit').textContent = d.name;
+  return d;
 }
 
 // the newest pick wins: an older load (a first-time convert is slow) that finishes later is dropped
 let umaSeq = 0;
-async function openUma(c, d) {
+async function openUma(c, d, key = active?.key || 'main') {
   const seq = ++umaSeq, stale = () => seq !== umaSeq;
   $('#umaOutfit').textContent = d.name;
   $('#overlay').textContent = `Loading ${c.name}…`;
@@ -184,8 +216,8 @@ async function openUma(c, d) {
   try {
     const r = await post('/api/load', { chara: c.id, dress: d.id }, `Loading ${c.name}…`);
     if (stale()) return;
-    await busy(`Loading ${c.name}…`, loadModel(r.pack, r.manifest, r.sets, c, d, stale));
-    if (!stale()) store.set('last', { chara: c.id, dress: d.id });
+    await busy(`Loading ${c.name}…`, loadModel(r.pack, r.manifest, r.sets, c, d, stale, key));
+    if (!stale() && key === 'main') store.set('last', { chara: c.id, dress: d.id });
   } catch (e) {
     if (stale()) return;
     $('#overlay').textContent = '';
@@ -193,7 +225,7 @@ async function openUma(c, d) {
   }
 }
 
-async function loadModel(pack, manifest, sets, chara, dress, stale = () => false) {
+async function loadModel(pack, manifest, sets, chara, dress, stale = () => false, key = active?.key || 'main') {
   const base = `/data/${encodeURIComponent(pack)}/`;
   const gltf = await new GLTFLoader().loadAsync(base + 'model.gltf');
 
@@ -217,8 +249,10 @@ async function loadModel(pack, manifest, sets, chara, dress, stale = () => false
   for (const mesh of meshes) {
     const ud = mesh.material.userData || {};
     const kind = kindOf(ud);
+    mesh.userData.kind = kind;   // the blender export rebuilds the shading from it
     const tex = {};
     for (const [slot, idx] of Object.entries(ud.textures || {})) tex[slot] = await getTex(idx);
+    mesh.userData.tex = tex;     // the blender export needs every map, not just the ones the view uses
     mesh.material.dispose();
     mesh.material = makeMaterial(kind, ud, tex);
     mesh.frustumCulled = false;
@@ -250,16 +284,30 @@ async function loadModel(pack, manifest, sets, chara, dress, stale = () => false
     gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
     return;
   }
-  if (current) {
-    place.remove(current.root);
-    current.root.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  // the uma with this key is replaced, or a new one joins
+  const old = cast.find(m => m.key === key);
+  if (current && current !== old) stash(current);
+  if (old) {
+    old.spot.remove(old.root);
+    old.root.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
   }
+  const spot = old?.spot || (cast.length ? newSpot(cast.length) : place);
   const root = gltf.scene;
-  place.add(root);
+  spot.add(root);
   const rest = new Map();
   root.traverse(o => { if (o.isBone || o.type === 'Object3D') rest.set(o, [o.position.clone(), o.quaternion.clone(), o.scale.clone()]); });
   current = { pack, base, manifest, sets, root, rest, outlines, chara: chara.id, name: chara.name, dress: dress.name, miniParts,
-              mixer: new THREE.AnimationMixer(root), action: null, clips: new Map(), springs: null, named: {} };
+              mixer: new THREE.AnimationMixer(root), action: null, clips: new Map(), springs: null, named: {},
+              key, spot, dressId: dress.id, g: null };
+  if (old) cast[cast.indexOf(old)] = current; else cast.push(current);
+  active = current;
+  place = spot;
+  face = null; faceBones = null; mini = null; eyeTrace = null;
+  look.yaw = 0; look.pitch = 0; look.set = new Map();
+  saveCast();
+  renderCast();
+  placeCast();
+  anim.touch();
   follow.root = null;
   current.mixer.timeScale = parseFloat($('#speed').value);
   props.onModel(current);
@@ -288,13 +336,100 @@ async function loadModel(pack, manifest, sets, chara, dress, stale = () => false
   }
 }
 
+// --- the cast -----------------------------------------------------------------------------------
+//
+// everyone in the scene. one is active: the panels (face, poses, props...) work on her and she is
+// `current`. each frame the others get the same treatment by swapping current and the few
+// per-uma globals (face, eyes, head turn, playing pose) for theirs.
+
+const cast = [];
+let active = null;
+
+function stash(m) {
+  m.g = { face, faceBones, faceState: { ...faceState }, mini, eyeTrace, look: { yaw: look.yaw, pitch: look.pitch, set: look.set },
+          poseKey, poseTitle };
+}
+function unstash(m) {
+  const g = m.g;
+  if (!g) return;
+  face = g.face; faceBones = g.faceBones; Object.assign(faceState, g.faceState); mini = g.mini; eyeTrace = g.eyeTrace;
+  look.yaw = g.look.yaw; look.pitch = g.look.pitch; look.set = g.look.set;
+  poseKey = g.poseKey; poseTitle = g.poseTitle;
+}
+function swapTo(m) {
+  if (!m || current === m) return;
+  if (current) stash(current);
+  current = m;
+  unstash(m);
+  place = m.spot;
+}
+/** fn for every uma in the scene, each as current; the active one is current again after. */
+function forCast(fn) {
+  const was = active;
+  for (const m of [...cast]) { swapTo(m); fn(m); }
+  swapTo(was);
+}
+
+const saveCast = () => store.set('cast', cast.map(m => ({ key: m.key, chara: m.chara, dress: m.dressId })));
+
+/** The panels switch to m. */
+function setActive(m) {
+  if (!m) return;
+  swapTo(m);
+  active = m;
+  place = m.spot;
+  const c = charas.find(x => x.id === m.chara);
+  if (c) umaHeader(c, m.dressId);
+  follow.root = null;
+  pose.onModel(m);
+  if (mini) { const st = mini.st; setupMiniFace(); mini.st = st; applyMiniFace(); }
+  else fillFace();
+  $('#scrub').max = m.action ? m.action.getClip().duration : 1;
+  fillPoses();
+  renderCast();
+  anim.touch();
+}
+
+function removeMember(m) {
+  if (cast.length < 2) return;
+  const i = cast.indexOf(m);
+  cast.splice(i, 1);
+  m.spot.remove(m.root);
+  scene.remove(m.spot);
+  m.root.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  m.springs = null;
+  props.reown(m.key, cast[0].key);
+  if (current === m) { current = null; active = null; }
+  setActive(m === active || !active ? cast[0] : active);
+  saveCast();
+  renderCast();
+}
+
+function renderCast() {
+  const box = $('#cast');
+  box.innerHTML = '';
+  box.style.display = cast.length > 1 ? '' : 'none';
+  for (const m of cast) {
+    const c = charas.find(x => x.id === m.chara);
+    const b = document.createElement('button');
+    b.className = 'castChip' + (m === active ? ' on' : '');
+    b.title = `${m.name}: click to work on her`;
+    b.innerHTML = '<img alt=""><span></span><i title="Take her out of the scene">✕</i>';
+    b.querySelector('img').src = `/api/icon/${c?.base || m.chara}`;
+    b.querySelector('span').textContent = m.name;
+    b.onclick = e => { if (e.target.tagName === 'I') removeMember(m); else if (m !== active) setActive(m); };
+    box.appendChild(b);
+  }
+}
+$('#castAdd').onclick = () => { openPicker(); pickerAdd = true; };
+
 // --- poses ------------------------------------------------------------------------------
 //
 // an outliner. similar motion sets fold into a family (Arms crossed 1, 1-1, 2…). a set plays
 // its main part, and the playing set shows a row of buttons for its other parts (start, loop,
 // end, still, reactions, cut-in shots). a category loads whole, once, and is searched here.
 
-const POSE_CATS = [['own', 'Her poses'], ['mini', 'Chibi'], ['event', 'Everyday'], ['charaevent', 'Characters'], ['victory', 'Victory'],
+const POSE_CATS = [['own', 'Her poses'], ['imported', 'Imported'], ['mini', 'Chibi'], ['event', 'Everyday'], ['charaevent', 'Characters'], ['victory', 'Victory'],
                    ['cutin', 'Cut-ins'], ['live', 'Dance'], ['home', 'Home'], ['training', 'Training'], ['story', 'Story']];
 let poseCat = store.get('poseCat', 'own');
 let poseKey = null;          // the part playing: a motion name (her own) or a library path
@@ -315,10 +450,20 @@ async function fillPoses() {
   const seq = ++poseSeq;
   const box = $('#poses');
   let sets, getClip;
+  $('#animImport').style.display = poseCat === 'imported' ? '' : 'none';
+  $('#libMirror').parentElement.style.display = poseCat === 'imported' || poseCat === 'own' ? 'none' : '';
   if (poseCat === 'own') {
     if (!current) { box.innerHTML = '<div class="empty">Choose an Uma first.</div>'; return; }
     sets = current.sets;
     getClip = ownClip;
+  } else if (poseCat === 'imported') {
+    try { sets = await importedSets(); } catch (e) { toast(e.message, true); return; }
+    if (seq !== poseSeq) return;
+    if (!sets.length) {
+      box.innerHTML = '<div class="empty">No animations yet. Import a .glb with animations on a humanoid rig: Mixamo (Download, FBX converted to glb, or glb), Quaternius\' Universal Animation Library, or anything else with a standard skeleton.</div>';
+      return;
+    }
+    getClip = importedClip;
   } else {
     const key = `${poseCat}|${$('#libMirror').checked ? 1 : 0}`;
     if (!libSets.has(key)) {
@@ -451,6 +596,59 @@ let poseTimer;
 $('#poseFilter').oninput = () => { clearTimeout(poseTimer); poseTimer = setTimeout(fillPoses, 120); };
 $('#libMirror').onchange = fillPoses;
 
+// --- imported animations ---------------------------------------------------------------------
+//
+// .glb files in Pictures\UmaStudio\animations: every clip in them shows as a pose, put on the
+// loaded uma when picked (retarget.js), then kept like her own.
+
+let importedList = null;
+async function importedSets() {
+  if (!importedList) {
+    const files = (await getJson('/api/anims', 'Loading animations…')).items;
+    importedList = [];
+    for (const f of files) {
+      const url = '/anims/' + encodeURIComponent(f.file);
+      let src;
+      try { src = await busy('Reading ' + f.file + '…', loadSource(url)); } catch { continue; }
+      const fam = f.file.replace(/\.glb$/i, '');
+      for (const c of src.animations) {
+        const name = c.name.replace(/^.*\|/, '').replace(/[_-]+/g, ' ').trim() || 'Animation';
+        importedList.push({ title: name, name, sub: fam, family: fam, parts: [['Loop', `anim:${f.file}|${c.name}`]], default: 0 });
+      }
+    }
+  }
+  return importedList;
+}
+
+async function importedClip(key, cur = current) {
+  if (cur.clips.has(key)) return cur.clips.get(key);
+  const [file, name] = key.slice(5).split('|');
+  const src = await loadSource('/anims/' + encodeURIComponent(file));
+  const clip = src.animations.find(c => c.name === name);
+  if (!clip) throw new Error('that animation is gone from ' + file);
+  const out = retarget(src, clip, cur);
+  cur.clips.set(key, out);
+  return out;
+}
+
+/** Any pose by its key, for an uma: her own motion, a library path or an imported animation. */
+function clipFor(m, key) {
+  return key.startsWith('anim:') ? importedClip(key, m) : key.includes('/') ? libraryClip(key, m) : ownClip(key, m);
+}
+
+$('#animImport').onclick = () => $('#animFile').click();
+$('#animFile').onchange = async () => {
+  const files = [...$('#animFile').files];
+  $('#animFile').value = '';
+  for (const f of files) {
+    try {
+      await call('/api/anims/upload?name=' + encodeURIComponent(f.name), { method: 'POST', headers: { 'X-Studio': '1' }, body: f }, 'Importing ' + f.name + '…');
+    } catch (e) { toast(e.message, true); }
+  }
+  importedList = null;
+  fillPoses();
+};
+
 function buildClip(m) {
   const times = new Float32Array(m.frames);
   for (let i = 0; i < m.frames; i++) times[i] = i / m.fps;
@@ -465,10 +663,10 @@ function buildClip(m) {
   return new THREE.AnimationClip(m.name, m.duration, tracks);
 }
 
-async function ownClip(name) {
-  if (current.clips.has(name)) return current.clips.get(name);
-  const clip = buildClip(await getJson(`${current.base}motions/${encodeURIComponent(name)}.json`, null));
-  current.clips.set(name, clip);
+async function ownClip(name, cur = current) {
+  if (cur.clips.has(name)) return cur.clips.get(name);
+  const clip = buildClip(await getJson(`${cur.base}motions/${encodeURIComponent(name)}.json`, null));
+  cur.clips.set(name, clip);
   return clip;
 }
 
@@ -484,13 +682,13 @@ function toOrigin(m) {
   for (let i = 0; i < v.length; i += 3) { v[i] -= x0; v[i + 1] -= floor; v[i + 2] -= z0; }
 }
 
-async function libraryClip(path) {
-  if (current.clips.has(path)) return current.clips.get(path);
+async function libraryClip(path, cur = current) {
+  if (cur.clips.has(path)) return cur.clips.get(path);
   const r = await getJson('/api/library/clip?path=' + encodeURIComponent(path), null);
   if (!r.clips.length) throw new Error('that pose has no usable motion');
   if (path.startsWith('3d/motion/live/')) toOrigin(r.clips[0]);
   const clip = buildClip(r.clips[0]);
-  current.clips.set(path, clip);
+  cur.clips.set(path, clip);
   return clip;
 }
 
@@ -498,7 +696,7 @@ async function libraryClip(path) {
 // comes off first, newest first: the head turn, then the pose mode offsets
 function runMotion(dt) {
   liftHeadTurn();
-  pose.liftEdits();
+  if (current === active) pose.liftEdits();
   current.mixer.update(dt);
 }
 
@@ -521,24 +719,121 @@ async function playClip(clip, key, autoplay, title) {
   poseTitle = title || poseTitle;
   $$('#poses .row.set').forEach(markPose);
   $('#scrub').max = clip.duration;
-  setPlaying(!!autoplay);
+  // on an animated scene the timeline stays where it is: she shows the pose at that moment
+  setPlaying(!!autoplay && !anim.active());
   runMotion(0);
   props.applyGrips();
+  // with motion keys on the timeline a picked pose goes in as a key where the timeline is
+  if (anim.active() && anim.motionKeys(current.key).length) {
+    anim.keyMotion(current.key, key, poseTitle);
+    setPlaying(false);
+    toast(`${current.name}: ${poseTitle} from ${anim.now().toFixed(2)} s`);
+  }
+  anim.touch();
 }
 
 let playing = false;
 function setPlaying(p) {
-  playing = p && !!(current && current.action);
-  if (current && current.action) current.action.paused = !playing;
+  playing = p && (!!(current && current.action) || anim.active());
+  for (const m of cast) if (m.action) m.action.paused = !playing;
   $('#play').textContent = playing ? '❚❚' : '▶';
 }
 function updateTime() {
-  const t = current && current.action ? current.action.time : 0;
+  const scene = anim.active();
+  const t = scene ? anim.now() : current && current.action ? current.action.time : 0;
   $('#time').textContent = t.toFixed(2) + 's';
+  if (scene) $('#scrub').max = anim.length();
+  else if (current?.action) $('#scrub').max = current.action.getClip().duration;
   if (document.activeElement !== $('#scrub')) $('#scrub').value = t;
+}
+
+/** Her motion at scene time t: her motion keys (each pose loops from its key, the switch blends
+ *  over BLEND seconds), or without keys the pose she has, looping. */
+const BLEND = 0.25;
+function motionAt(t) {
+  if (!current) return;
+  const keys = anim.motionKeys(current.key);
+  if (!keys.length) {
+    if (!current.action) return;
+    current.action.enabled = true;
+    const d = current.action.getClip().duration || 1;
+    current.action.time = t % d;
+    runMotion(0);
+    return;
+  }
+  let i = 0;
+  while (i + 1 < keys.length && keys[i + 1].t <= t) i++;
+  const k = keys[i], prev = i > 0 ? keys[i - 1] : null;
+  // 'rest': no motion, her skeleton as it was modelled (a T-pose)
+  if (k.clip === 'rest') {
+    for (const x of current.mixer._actions) x.enabled = false;
+    for (const [o, [p, q, s]] of current.rest) { o.position.copy(p); o.quaternion.copy(q); o.scale.copy(s); }
+    current.action = null;
+    runMotion(0);
+    return;
+  }
+  const b = current.clips.get(k.clip), a = prev && prev.clip !== 'rest' && current.clips.get(prev.clip);
+  if (!b) needClip(current, k.clip);
+  if (prev && !a) needClip(current, prev.clip);
+  if (!b) { runMotion(0); return; }
+  const lt = Math.max(0, t - k.t);
+  const w = a ? Math.min(1, lt / BLEND) : 1;
+  const ab = current.mixer.clipAction(b), aa = w < 1 ? current.mixer.clipAction(a) : null;
+  for (const x of current.mixer._actions) if (x !== ab && x !== aa && !current.grips?.includes(x)) x.enabled = false;
+  // one-shot clips (a fall, a jump) hold their last frame instead of starting over; library
+  // clips are one-shots unless named _Loop
+  const once = key => key.once ?? (/^anim:/.test(key.clip) && !/_Loop$/.test(key.clip));
+  const put = (x, time, weight, one) => {
+    x.enabled = true;
+    x.setLoop(THREE.LoopRepeat, Infinity);
+    x.play();
+    x.setEffectiveWeight(weight);
+    const d = x.getClip().duration || 1;
+    x.time = one ? Math.min(time, d - 1e-3) : time % d;
+  };
+  put(ab, lt, w, once(k));
+  if (aa) put(aa, t - prev.t, 1 - w, once(prev));
+  // sitting: the game's skirt rule swings the panels clear of raised knees into a flat shelf,
+  // so the skirt just rests on the thighs instead
+  if (current.springs) current.springs.skirt = !/sit|driving/i.test(k.clip);
+  current.action = ab;
+  runMotion(0);
+}
+
+/** Her face at scene time t from her face keys (the first one holds before it). */
+function faceAt(t) {
+  const keys = anim.faceKeys(current.key);
+  if (!keys.length || !face) return;
+  let i = 0;
+  while (i + 1 < keys.length && keys[i + 1].t <= t) i++;
+  if (current.faceShown === keys[i].face) return;
+  const p = face.presets.find(x => x.label === keys[i].face);
+  if (!p) return;
+  current.faceShown = keys[i].face;
+  for (const k of Object.keys(faceState)) faceState[k] = p[k] || 'Base';
+}
+
+/** Loads a pose an uma's motion keys need (once), in the background. */
+function needClip(m, key) {
+  m.loading ??= new Set();
+  if (m.loading.has(key)) return;
+  m.loading.add(key);
+  clipFor(m, key).catch(e => toast(`${m.name}: ${e.message}`, true));
+}
+
+/** Every pose the motion keys need, loaded (before a video). */
+async function loadMotionClips() {
+  for (const m of cast) for (const k of anim.motionKeys(m.key)) if (k.clip !== 'rest' && !m.clips.has(k.clip)) await clipFor(m, k.clip);
 }
 $('#play').onclick = () => setPlaying(!playing);
 $('#scrub').oninput = () => {
+  if (anim.active()) {
+    setPlaying(false);
+    anim.seek(parseFloat($('#scrub').value));
+    current?.springs?.reset();
+    updateTime();
+    return;
+  }
   if (!current || !current.action) return;
   setPlaying(false);
   current.action.time = parseFloat($('#scrub').value);
@@ -546,7 +841,7 @@ $('#scrub').oninput = () => {
   current.springs?.reset();
   updateTime();
 };
-$('#speed').onchange = () => { if (current) current.mixer.timeScale = parseFloat($('#speed').value); };
+$('#speed').onchange = () => { for (const m of cast) m.mixer.timeScale = parseFloat($('#speed').value); };
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && !['INPUT', 'SELECT'].includes(document.activeElement.tagName)) { e.preventDefault(); setPlaying(!playing); }
 });
@@ -660,6 +955,9 @@ function setFace(label) {
   const p = face && face.presets.find(x => x.label === label);
   if (!p) return;
   for (const k of Object.keys(faceState)) faceState[k] = p[k] || 'Base';
+  current.facePicked = label;
+  // with face keys on the timeline a picked face goes in as a key where the timeline is
+  if (anim.active() && anim.faceKeys(current.key).length && current === active) anim.keyFace(current.key, label);
   const chip = $(`#faces .chip[data-face="${label}"]`);
   radio('#faces .chip', chip);
   $('#facePreset').value = chip ? '' : label;
@@ -838,7 +1136,7 @@ function unityAngle(e) {
 }
 
 function applyProcess() {
-  pose.applyEdits();   // hand-made joint changes first: the helper bones follow the final angles
+  if (current === active) pose.applyEdits();   // hand-made joint changes first: the helper bones follow the final angles
   if (!current?.process) return;
   for (const [obj, list] of current.process) {
     const sum = { position: null, rotation: null, scale: null };
@@ -924,6 +1222,14 @@ function setFollow(mode) {
   follow.at = followPoint();
 }
 
+/** The same for an uma that isn't followed. */
+function jumped(m) {
+  const p = bonePos('Position', null);
+  const j = !!(p && m.lastRoot && p.distanceTo(m.lastRoot) > JUMP);
+  m.lastRoot = p;
+  return j;
+}
+
 /** True when the root jumped since the last call. */
 function rootJumped() {
   const p = bonePos('Position', null);
@@ -967,12 +1273,28 @@ $('#bright').oninput = () => { U.bright.value = parseFloat($('#bright').value); 
 $('#rim').oninput = () => { U.rim.value = parseFloat($('#rim').value); };
 $('#outlineW').oninput = () => { U.outlineW.value = parseFloat($('#outlineW').value); };
 $('#outline').onchange = () => {
-  current?.outlines.forEach(o => { o.visible = $('#outline').checked; });
+  for (const m of cast) m.outlines.forEach(o => { o.visible = $('#outline').checked; });
   props.setOutlines($('#outline').checked);
+};
+// the finishing pass's settings (post.js), kept between sessions
+Object.assign(finish, store.get('finish', {}));
+for (const [id, key] of [['#postLines', 'lines'], ['#postLineDist', 'lineDist'], ['#postBloom', 'bloom'], ['#postSat', 'sat'],
+                         ['#postContrast', 'contrast'], ['#postWarm', 'warm'], ['#postVignette', 'vignette']]) {
+  $(id).value = finish[key];
+  $(id).oninput = () => { finish[key] = parseFloat($(id).value); store.set('finish', finish); };
+}
+$('#postOn').checked = finish.on;
+$('#postOn').onchange = () => { finish.on = $('#postOn').checked; store.set('finish', finish); };
+$('#postReset').onclick = () => {
+  Object.assign(finish, { on: true, lines: 0.8, lineDist: 40, bloom: 0.2, sat: 1.12, contrast: 1.06, warm: 0.3, vignette: 0.35 });
+  store.set('finish', finish);
+  for (const [id, key] of [['#postLines', 'lines'], ['#postLineDist', 'lineDist'], ['#postBloom', 'bloom'], ['#postSat', 'sat'],
+                           ['#postContrast', 'contrast'], ['#postWarm', 'warm'], ['#postVignette', 'vignette']]) $(id).value = finish[key];
+  $('#postOn').checked = true;
 };
 $('#eyeCell').onchange = () => U.eyeCell.value.set(+$('#eyeCell').value, 0);
 $('#eyeHi').oninput = () => { U.eyeHi.value = parseFloat($('#eyeHi').value); };
-$('#physics').onchange = () => current?.springs?.setEnabled($('#physics').checked);
+$('#physics').onchange = () => { for (const m of cast) m.springs?.setEnabled($('#physics').checked); };
 
 // the springs, from the rest skeleton like the game binds them. with body collisions on, hair and
 // ties also get colliders fitted to her outfit (bodyfit.js), so changing those makes new springs
@@ -981,7 +1303,7 @@ function newSprings() {
   const body = $('#bodyCol').checked
     ? { shapes: mine.bodyFit ??= fitBody(mine.root), clearance: parseFloat($('#bodyGap').value) / 1000 } : null;
   GameSprings.create(mine.root, mine.rest, mine.pack, body).then(sp => {
-    if (current !== mine || !sp) return;
+    if (!cast.includes(mine) || !sp) return;
     mine.springs = sp;
     sp.setEnabled($('#physics').checked);
   }).catch(e => toast('Physics: ' + e.message, true));
@@ -1046,7 +1368,7 @@ async function openStage(id, cond = condOf(id), alt = altOf(id)) {
   const group = await busy('Loading the place…', loadStage(info, renderer));
   if (liveStage.group) {
     scene.remove(liveStage.group);
-    liveStage.group.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.map?.dispose(); o.material.dispose(); } });
+    disposeGroup(liveStage.group);
   }
   liveStage.group = group;
   liveStage.id = id;
@@ -1056,6 +1378,7 @@ async function openStage(id, cond = condOf(id), alt = altOf(id)) {
   scene.add(group);
   showParts(group, stageParts());
   stageLoaded(group, id);
+  anim.touch();
   $('#bgStageName').textContent = item.name;
   $('#bgStageThumb').src = `/data/_stages/${item.dir}/thumb.jpg`;
   // the season / weather / time this place comes in, the rest of the controls it has parts for
@@ -1090,6 +1413,30 @@ CONDS.forEach(([sel]) => {
 $('#placeAlt').onchange = () => {
   if (liveStage.id) openStage(liveStage.id, condOf(liveStage.id), $('#placeAlt').value).catch(e => toast(e.message, true));
 };
+
+/** Another place to mix into the one showing (stagedit.js adds it): converted and loaded on its own. */
+async function loadExtraPlace(id, cond, alt) {
+  const item = (await placeItems()).find(it => it.id === id);
+  if (!item) throw new Error('That place is not downloaded');
+  const info = await post('/api/stage/load', { id, cond, alt }, `Building ${item.name}…`);
+  return { group: await busy('Loading the place…', loadStage(info, renderer)), item };
+}
+
+function disposeGroup(g) {
+  g.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.map?.dispose(); o.material.lightMap?.dispose(); o.material.dispose(); } });
+}
+
+/** Places were added or taken out: the switches and beams cover them too. */
+function extrasChanged() {
+  const group = liveStage.group;
+  if (!group) return;
+  group.userData.beams = null;
+  showParts(group, stageParts());
+  const kinds = partKinds(group);
+  $('#stageLightsRow').style.display = kinds.has('lights') ? '' : 'none';
+  $('#stageCrowdRow').style.display = kinds.has('crowd') ? '' : 'none';
+  $('#stageFxRow').style.display = kinds.has('effects') ? '' : 'none';
+}
 
 /** A small picture of the place for the picker: a stage from the crowd, anywhere else the view. */
 function stageThumb(item) {
@@ -1135,7 +1482,8 @@ function stageThumb(item) {
   }).catch(() => {});
 }
 
-async function chooseStage() {
+/** The place picker: resolves to a place id, or null when closed. */
+async function pickPlace(title = 'Choose a place') {
   const items = await placeItems();
   const kinds = PLACE_KINDS.filter(([k]) => items.some(it => it.kind === k));
   let tab = store.get('placeTab', 'live');
@@ -1174,11 +1522,17 @@ async function chooseStage() {
   $('#placeFilter').value = '';
   $('#placeFilter').oninput = fill;
   fill();
+  $('#stagePickerTitle').textContent = title;
   $('#stagePicker').style.display = 'block';
   $('#stagePickerClose').onclick = () => done(null);
   $('#stagePicker').onmousedown = e => { if (e.target.id === 'stagePicker') done(null); };
   const id = await picked;
   $('#stagePicker').style.display = 'none';
+  return id;
+}
+
+async function chooseStage() {
+  const id = await pickPlace();
   if (!id) return false;
   await openStage(id).catch(e => { toast(e.message, true); throw e; });
   return true;
@@ -1345,6 +1699,7 @@ $('#sizeW').onchange = $('#sizeH').onchange = () => useSize(customSize(), true);
 // --- rendering frames ----------------------------------------------------------------------------
 
 /** Render what is inside the guide at (w x h) * ss. Returns straight-alpha RGBA, rows top-down. */
+let frameChain = null, liveChain = null;
 function renderFrame(w, h, ss = 1) {
   const RW = w * ss, RH = h * ss;
   const g = guideRect();
@@ -1353,17 +1708,25 @@ function renderFrame(w, h, ss = 1) {
   camera.setViewOffset(g.W, g.H, g.x, g.y, g.w, g.h);
   camera.updateProjectionMatrix();
   updateLight();
-  const rt = new THREE.WebGLRenderTarget(RW, RH, { samples: 4, stencilBuffer: true });
   const bg = background();
+  const post = finish.on && !!bg;
+  const rt = new THREE.WebGLRenderTarget(RW, RH, { samples: post ? 0 : 4, stencilBuffer: true });
   placeBg(true);
   faceCamera(liveStage.group, camera);
   props.gizmo(false);
   stageGizmo(false);
   pose.gizmo(false);
-  renderer.setRenderTarget(rt);
   renderer.setClearColor(bg && bg !== 'picture' && bg !== 'stage' ? new THREE.Color(bg) : 0x000000, bg ? 1 : 0);
-  renderer.clear(true, true, true);
-  renderer.render(scene, camera);
+  if (post) {
+    // the finishing pass (post.js), kept for the size: a video draws hundreds of frames
+    if (!frameChain || frameChain.w !== RW || frameChain.h !== RH) { frameChain?.dispose(); frameChain = makeChain(renderer, scene, camera, RW, RH, false); }
+    frameChain.render();
+    frameChain.copyTo(rt);
+  } else {
+    renderer.setRenderTarget(rt);
+    renderer.clear(true, true, true);
+    renderer.render(scene, camera);
+  }
   props.gizmo(true);
   stageGizmo(true);
   pose.gizmo(true);
@@ -1467,14 +1830,17 @@ chipGroup('#vidFmt', 'fmt', 'fmt', 'vidFmt');
 chipGroup('#vidFps', 'fps', 'fps', 'vidFps', Number);
 
 async function recordVideo() {
-  if (!current || !current.action) return toast('Pick a pose to record first', true);
+  const scene = anim.active();
+  if (!current || !(current.action || scene)) return toast('Pick a pose to record first', true);
   let [w, h] = targetSize();
   // GIFs this big would be enormous, and codecs want even sizes
   if (video.fmt === 'gif') { const k = Math.min(1, 720 / Math.max(w, h)); w = Math.round(w * k); h = Math.round(h * k); }
   w -= w % 2; h -= h % 2;
   const fps = video.fmt === 'gif' ? Math.min(30, video.fps) : video.fps;
-  const clip = current.action.getClip();
-  const seconds = video.len === 'loop' ? clip.duration : Number(video.len);
+  const clip = current.action?.getClip();
+  if (scene) await busy('Loading poses…', loadMotionClips());
+  // with an animation "full" is the whole of it, from the start
+  const seconds = video.len === 'loop' ? (scene ? anim.length() : clip.duration) : Number(video.len);
   const frames = Math.max(1, Math.round(seconds * fps));
   const { id } = await post('/api/video/start', { w, h, fps, format: video.fmt, name: fileName() });
 
@@ -1483,37 +1849,55 @@ async function recordVideo() {
   setPlaying(false);
   $('#recBar').style.display = 'flex';
   $('#record').disabled = $('#render').disabled = true;
-  const start = video.len === 'loop' ? 0 : current.action.time;
+  const start = video.len === 'loop' ? 0 : scene ? anim.now() : current.action.time;
+  const sceneWas = anim.now();
   const step = 1 / fps;
   // following moves the camera along the video, the view gets its own camera back after
   const view = { pos: camera.position.clone(), target: controls.target.clone(), at: follow.at?.clone(), root: follow.root };
   try {
     // the game steps its physics at 60 Hz, each frame shows the tick nearest its time
-    const springs = current.springs?.enabled ? current.springs : null;
-    const poseAt = t => { current.action.time = (start + t) % clip.duration; runMotion(0); applyProcess(); applyFace(); };
+    const springs = cast.some(m => m.springs?.enabled);
+    const stepAll = () => Promise.all(cast.map(m => m.springs?.enabled ? m.springs.step() : null));
+    const poseAt = t => {
+      if (scene) {
+        anim.apply(start + t, true);
+        props.animateModels(start + t);
+      }
+      forCast(m => {
+        if (scene) { motionAt(start + t); faceAt(start + t); }
+        else if (m.action) {
+          m.action.time = (start + t) % (m.action.getClip().duration || 1);
+          runMotion(0);
+        }
+        applyProcess();
+        applyFace();
+      });
+    };
     let ticks = 0;
-    if (springs) { springs.reset(); poseAt(0); await springs.step(); }
+    if (springs) { for (const m of cast) m.springs?.reset(); poseAt(0); await stepAll(); }
     for (let i = 0; i < frames; i++) {
       if (recording.cancel) throw new Error('cancelled');
       if (springs) {
         const target = Math.round(i * step / TICK);
-        while (ticks < target) { ticks++; poseAt(ticks * TICK); await springs.step(); }
+        while (ticks < target) { ticks++; poseAt(ticks * TICK); await stepAll(); }
       } else poseAt(i * step);
-      current.root.updateMatrixWorld(true);
+      forCast(m => m.root.updateMatrixWorld(true));
       const cut = rootJumped();
-      followCamera(step, i === 0 || cut);
-      applyHeadTurn(i === 0 ? 0 : step);
-      applyEyeTrace(i === 0 ? 0 : step);
+      if (!anim.hasCamera()) followCamera(step, i === 0 || cut);
+      forCast(() => {
+        applyHeadTurn(i === 0 ? 0 : step);
+        applyEyeTrace(i === 0 ? 0 : step);
+      });
       props.updateProps();
       const frame = renderFrame(w, h, 1);
       // a local request can still drop now and then, one lost frame shouldn't end the video
-      for (let tries = 3; ; tries--) {
+      for (let tries = 1; ; tries++) {
         try {
           await call(`/api/video/frame?id=${id}`, { method: 'POST', headers: { 'X-Studio': '1' }, body: frame.data }, null);
           break;
         } catch (e) {
-          if (tries <= 1) throw e;
-          await new Promise(r => setTimeout(r, 300));
+          if (tries >= 6) throw e;
+          await new Promise(r => setTimeout(r, 300 * tries));
         }
       }
       $('#recProg').value = (i + 1) / frames;
@@ -1530,6 +1914,7 @@ async function recordVideo() {
     controls.target.copy(view.target);
     Object.assign(follow, { at: view.at || null, root: view.root });
     recording = null;
+    if (scene) { anim.seek(sceneWas); anim.apply(sceneWas, true); }
     $('#recBar').style.display = 'none';
     $('#record').disabled = $('#render').disabled = false;
     setPlaying(wasPlaying);
@@ -1707,9 +2092,285 @@ async function exportModel() {
 }
 $('#exportModel').onclick = () => exportModel().catch(e => toast(e.message, true));
 
+// --- to blender ----------------------------------------------------------------------------------
+//
+// the whole scene for blender (blender/uma_scene.py builds the look there: toon shading from the
+// game's own maps, outlines, sun shadows, haze, depth of field, glow). into
+// Pictures\UmaStudio\blender\<name>\: scene.glb with everything baked over the timeline (every
+// uma's motion keys, physics, face and eyes, the props, keyed place parts, the camera), the
+// textures blender can't get from a glTF (the shadow colour and shading masks), and scene.json.
+
+async function putFile(dir, path, body) {
+  await call(`/api/blender/put?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(path)}`,
+             { method: 'POST', headers: { 'X-Studio': '1' }, body }, null);
+}
+
+/** A texture's picture as png bytes (null when it has none). */
+async function texturePng(t) {
+  const img = t?.image;
+  if (!img || !img.width) return null;
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  const x = c.getContext('2d');
+  if (img.data) x.putImageData(new ImageData(new Uint8ClampedArray(img.data.buffer ?? img.data), img.width, img.height), 0, 0);
+  else x.drawImage(img, 0, 0);
+  return await new Promise(r => c.toBlob(r, 'image/png'));
+}
+
+async function exportBlender() {
+  if (!current) return openPicker();
+  const scene3 = anim.active();
+  if (!scene3 && !current.action) return toast('Pick a pose first', true);
+  const fps = Math.min(60, video.fps);
+  const seconds = scene3 ? anim.length() : current.action.getClip().duration;
+  const frames = Math.max(1, Math.round(seconds * fps));
+  const dir = fileName().replace(/[^\w\-. ]/g, '_').slice(0, 100);
+  const [W, H] = targetSize();
+  const wasPlaying = playing;
+  setPlaying(false);
+  recording = { cancel: false };
+  const sceneWas = anim.now();
+  const view = { pos: camera.position.clone(), target: controls.target.clone(), at: follow.at?.clone(), root: follow.root, fov: camera.fov };
+  const undo = [];
+  const out = new THREE.Group();
+  out.name = 'UmaStudio';
+  try {
+    if (scene3) await busy('Loading poses…', loadMotionClips());
+    const info = props.exportInfo();
+    const textures = new Map();   // texture -> file name
+    const saveTex = async t => {
+      if (!t?.image) return null;
+      if (!textures.has(t)) {
+        const png = await texturePng(t);
+        if (!png) return null;
+        const name = `tex/${textures.size}.png`;
+        await putFile(dir, name, png);
+        textures.set(t, name);
+      }
+      return textures.get(t);
+    };
+    // the umas' and props' materials: a plain textured one for glTF, the rest by name in extras
+    const hidden = new Set([...cast.flatMap(m => m.outlines), ...info.props.flatMap(p => p.outlines)]);
+    const roots = [...cast.map(m => m.spot), info.group];
+    const nodes = [];
+    let n = 0;
+    for (const r of roots) {
+      const meshes = [];
+      r.traverse(o => { if (o.isMesh) meshes.push(o); });
+      for (const o of meshes) {
+        if (hidden.has(o) || o.material?.blending === THREE.CustomBlending) {
+          const v = o.visible; o.visible = false; undo.push(() => { o.visible = v; });
+          continue;
+        }
+        if (!o.material?.uniforms) {
+          // an imported model's own material; a prop marked as ground (holder.userData.env) is
+          // shaded like the place, without outlines
+          let env = false;
+          for (let a = o; a && !env; a = a.parent) env = !!a.userData?.env;
+          const mm = o.material, had = mm.userData;
+          mm.userData = env ? { ...had, env: true } : { ...had, prop: true };
+          undo.push(() => { mm.userData = had; });
+          continue;
+        }
+        const m = o.material, u = m.uniforms;
+        const plain = exportMaterial(m);
+        plain.userData = {
+          uma: o.userData.kind || 'prop',   // her parts have a kind; picture cards and boxes don't
+          toon: u.uHasToon?.value > 0.5 ? await saveTex(u.uToon.value) : null,
+          triple: u.uHasTriple?.value > 0.5 ? await saveTex(u.uTriple.value) : null,
+          ctrl: o.userData.tex?._OptionMaskMap ? await saveTex(o.userData.tex._OptionMaskMap) : null,
+          cutout: u.uCutout?.value || 0,
+        };
+        o.material = plain;
+        undo.push(() => { o.material.map?.isCanvasTexture && o.material.map.dispose(); o.material.dispose(); o.material = m; });
+        const col = o.geometry.getAttribute('color');
+        if (col) { o.geometry.deleteAttribute('color'); undo.push(() => o.geometry.setAttribute('color', col)); }
+      }
+    }
+    // the place: unlit in glTF; vertex light at half brightness doubled into the colours, glow
+    // (light beams, bulbs) left out
+    let placeRoot = null;
+    if (shot.bg === 'stage' && liveStage.group) {
+      placeRoot = liveStage.group;
+      const meshes = [];
+      placeRoot.traverse(o => { if (o.isMesh) meshes.push(o); });
+      for (const o of meshes) {
+        if (!o.visible) continue;
+        const m = o.material;
+        if (m.blending === THREE.AdditiveBlending || !m.map) {
+          if (m.blending === THREE.AdditiveBlending || !m.color) { o.visible = false; undo.push(() => { o.visible = true; }); }
+          continue;
+        }
+        const had = m.userData;
+        m.userData = { ...had, env: true };
+        undo.push(() => { m.userData = had; });
+        const col = o.geometry.getAttribute('color');
+        if (col && !m.vertexColors) { o.geometry.deleteAttribute('color'); undo.push(() => o.geometry.setAttribute('color', col)); }
+        else if (col && m.vertexColors) {
+          const k = Math.max(m.color.r, m.color.g, m.color.b, 1e-3);
+          const c2 = col.clone();
+          for (let i = 0; i < c2.count; i++) for (let j = 0; j < Math.min(3, c2.itemSize); j++) c2.setComponent(i, j, Math.min(1, c2.getComponent(i, j) * k));
+          o.geometry.setAttribute('color', c2);
+          const keep = m.color.clone();
+          m.color.multiplyScalar(1 / k);
+          undo.push(() => { o.geometry.setAttribute('color', col); m.color.copy(keep); });
+        }
+      }
+    }
+    // the camera as it renders: the guide's aspect and its vertical view
+    const cam = new THREE.PerspectiveCamera(camera.fov, W / H, 0.05, 3000);
+    cam.name = 'Camera';
+    const g = guideRect();
+    // the picture is the guide's part of the view: its vertical angle
+    const effFov = () => THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * g.h / g.H));
+    out.add(cam);
+
+    // every node that may move gets a name of its own
+    const named = new Set();
+    const unique = o => {
+      if (!o.name || named.has(o.name)) { const nm = o.name; o.name = `${nm || 'node'}_${++n}`; undo.push(() => { o.name = nm; }); }
+      named.add(o.name);
+    };
+    for (const r of roots) r.traverse(o => { if (!o.isMesh || o.isSkinnedMesh || o.morphTargetInfluences) { unique(o); nodes.push(o); } });
+    const animated = anim.animatedObjects().filter(o => placeRoot && placeRoot.getObjectById(o.id));
+    for (const o of animated) { unique(o); nodes.push(o); }
+    unique(cam);
+    const morphs = [];
+    for (const r of roots) r.traverse(o => { if (o.isMesh && o.morphTargetInfluences?.length) morphs.push(o); });
+
+    // walk the timeline like a video does
+    const step = 1 / fps;
+    const keys = nodes.map(() => ({ p: [], q: [], s: [] }));
+    const camKeys = { p: [], q: [], fov: [] };
+    const morphKeys = morphs.map(() => []);
+    const springs = cast.some(m => m.springs?.enabled);
+    const stepAll = () => Promise.all(cast.map(m => m.springs?.enabled ? m.springs.step() : null));
+    const start = 0;
+    const poseAt = t => {
+      if (scene3) { anim.apply(start + t, true); props.animateModels(start + t); }
+      forCast(m => {
+        if (scene3) { motionAt(start + t); faceAt(start + t); }
+        else if (m.action) { m.action.time = (start + t) % (m.action.getClip().duration || 1); runMotion(0); }
+        applyProcess();
+        applyFace();
+      });
+    };
+    let ticks = 0;
+    if (springs) { for (const m of cast) m.springs?.reset(); poseAt(0); await stepAll(); }
+    $('#recBar').style.display = 'flex';
+    for (let i = 0; i < frames; i++) {
+      if (recording.cancel) throw new Error('cancelled');
+      if (springs) {
+        const target = Math.round(i * step / TICK);
+        while (ticks < target) { ticks++; poseAt(ticks * TICK); await stepAll(); }
+      } else poseAt(i * step);
+      forCast(m => m.root.updateMatrixWorld(true));
+      const cut = rootJumped();
+      if (!anim.hasCamera()) followCamera(step, i === 0 || cut);
+      forCast(() => { applyHeadTurn(i === 0 ? 0 : step); applyEyeTrace(i === 0 ? 0 : step); });
+      props.updateProps();
+      // hidden things go to nothing (glTF has no visibility)
+      nodes.forEach((o, k) => {
+        keys[k].p.push(...o.position.toArray());
+        keys[k].q.push(...o.quaternion.toArray());
+        if (o.visible) keys[k].s.push(...o.scale.toArray()); else keys[k].s.push(0, 0, 0);
+      });
+      camera.updateMatrixWorld();
+      camKeys.p.push(...camera.position.toArray());
+      camKeys.q.push(...camera.quaternion.toArray());
+      camKeys.fov.push(camera.fov);
+      morphs.forEach((o, k) => morphKeys[k].push(...o.morphTargetInfluences));
+      $('#recProg').value = (i + 1) / frames;
+      $('#recText').textContent = `baking ${i + 1} / ${frames}`;
+      if (i % 10 === 9) await new Promise(r => setTimeout(r, 0));
+    }
+    const times = Float32Array.from({ length: frames }, (_, i) => i * step);
+    const moves = (v, w) => v.some((x, i) => Math.abs(x - v[i % w]) > 1e-5);
+    const tracks = [];
+    nodes.forEach((o, k) => {
+      if (moves(keys[k].p, 3)) tracks.push(new THREE.VectorKeyframeTrack(`${o.name}.position`, times, keys[k].p));
+      if (moves(keys[k].q, 4)) tracks.push(new THREE.QuaternionKeyframeTrack(`${o.name}.quaternion`, times, keys[k].q));
+      if (moves(keys[k].s, 3)) tracks.push(new THREE.VectorKeyframeTrack(`${o.name}.scale`, times, keys[k].s));
+    });
+    tracks.push(new THREE.VectorKeyframeTrack('Camera.position', times, camKeys.p));
+    tracks.push(new THREE.QuaternionKeyframeTrack('Camera.quaternion', times, camKeys.q));
+    morphs.forEach((o, k) => { unique(o); tracks.push(new THREE.NumberKeyframeTrack(`${o.name}.morphTargetInfluences`, times, morphKeys[k])); });
+    const clip = new THREE.AnimationClip('scene', frames * step, tracks);
+
+    // back to the first frame for the file's rest state
+    poseAt(0);
+    props.updateProps();
+    cam.position.fromArray(camKeys.p, 0);
+    cam.quaternion.fromArray(camKeys.q, 0);
+    cam.fov = effFov();
+    // things that come in later are hidden now, and glTF leaves hidden things out: they go in
+    // whole, their tracks keep them at nothing until they show
+    // (groups only: meshes hidden here are outlines and blush the export leaves out on purpose)
+    for (const o of nodes) if (!o.visible && !o.isMesh) { o.visible = true; undo.push(() => { o.visible = false; }); }
+    // and keyed parts of the place hidden at the start (the turf before it's laid)
+    for (const o of animated) if (!o.visible) { o.visible = true; undo.push(() => { o.visible = false; }); }
+    const parents = roots.map(r => r.parent);
+    const placeParent = placeRoot?.parent;
+    out.add(...roots);
+    if (placeRoot) out.add(placeRoot);
+    let glb;
+    try {
+      glb = await busy('Writing the scene…', new GLTFExporter().parseAsync(out, { binary: true, onlyVisible: true, animations: [clip] }));
+    } finally {
+      roots.forEach((r, i) => parents[i].add(r));
+      if (placeRoot) placeParent.add(placeRoot);
+      out.remove(cam);
+    }
+    await busy('Saving…', putFile(dir, 'scene.glb', new Blob([glb])));
+    // what the blender script needs besides the file
+    const headOf = m => { let h = null; m.root.traverse(o => { if (!h && o.isBone && /^Head(_\d+)?$/.test(o.name)) h = o; }); return h; };
+    const focus = cast.map(m => ({ key: m.key, name: m.name, head: headOf(m)?.name || null, root: m.spot.name }));
+    const meta = {
+      fps, frames, width: W, height: H, fov: effFov(),
+      lightAz: parseFloat($('#lightAz').value), lightEl: parseFloat($('#lightEl').value), lightFollowsCamera: $('#lightFollow').checked,
+      background: shot.bg === 'stage' ? 'place' : shot.bg || 'transparent', bgColor: shot.bg?.startsWith('#') ? shot.bg : null,
+      focusOn: active.key, cast: focus, place: placeRoot ? liveStage.id : null,
+      textures: textures.size,
+    };
+    await putFile(dir, 'scene.json', new Blob([JSON.stringify(meta, null, 1)]));
+    toast(`Saved for Blender: ${dir}`, false, ['Render in Blender', () => renderBlender(dir)]);
+    return dir;
+  } finally {
+    undo.reverse().forEach(f => f());
+    $('#recBar').style.display = 'none';
+    recording = null;
+    camera.position.copy(view.pos);
+    controls.target.copy(view.target);
+    camera.fov = view.fov;
+    camera.updateProjectionMatrix();
+    Object.assign(follow, { at: view.at || null, root: view.root });
+    if (scene3) { anim.seek(sceneWas); anim.apply(sceneWas, true); }
+    setPlaying(wasPlaying);
+  }
+}
+
+/** Blender renders the exported scene in the background (blender/uma_scene.py); progress in the status bar. */
+async function renderBlender(dir, still = false) {
+  const { id } = await post('/api/blender/render', { dir, still }, 'Starting Blender…');
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1500));
+    const s = await getJson('/api/blender/status?id=' + id, null);
+    if (s.done) {
+      if (s.error) return toast('Blender: ' + s.error, true);
+      return toast(`Blender finished: ${s.output}`, false, ['Show', openSaved]);
+    }
+    $('#warm').textContent = s.progress ? `Blender · ${s.progress}` : 'Blender · starting';
+  }
+}
+$('#exportBlender').onclick = async () => {
+  const dir = await exportBlender().catch(e => { if (e.message !== 'cancelled') toast(e.message, true); return null; });
+  if (dir && $('#blenderRender').checked) renderBlender(dir).catch(e => toast(e.message, true));
+};
+
 // --- loop ----------------------------------------------------------------------------------------
 
 const clock = new THREE.Clock();
+let modelClock = 0;     // the models' own animations when nothing is animated
 let stepping = false;   // a physics step is out: this frame is drawn once it is back
 function draw() {
   props.updateProps();
@@ -1718,26 +2379,55 @@ function draw() {
   placeBg(false);
   faceCamera(liveStage.group, camera);
   updateStageEdit();
-  renderer.render(scene, camera);
+  if (finish.on && solidBg()) {
+    // the view shows the finished look too; the canvas is otherwise see-through over a css colour
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    if (!liveChain) liveChain = makeChain(renderer, scene, camera, size.x, size.y, true);
+    else if (liveChain.w !== size.x || liveChain.h !== size.y) liveChain.setSize(size.x, size.y);
+    renderer.setClearColor(shot.bg.startsWith('#') || shot.bg === 'custom' ? new THREE.Color(shot.bg === 'custom' ? $('#bgColor').value : shot.bg) : 0x000000, 1);
+    liveChain.render();
+    renderer.setClearColor(0x000000, 0);
+  } else renderer.render(scene, camera);
+}
+
+/** A background the frame fills completely (no see-through). */
+function solidBg() {
+  if (!shot.bg) return false;
+  if (shot.bg === 'stage') return !!liveStage.group;
+  if (shot.bg === 'picture') return !!bgPic.tex;
+  return true;
 }
 renderer.setAnimationLoop(() => {
   if (recording || stepping) return;   // the recorder drives every frame itself
   const dt = Math.min(clock.getDelta(), 0.1);
   controls.update();
   let tick = null;
+  // with an animation the scene clock leads: her motion, the keyed things, the models
+  const scene = anim.active();
+  const speed = current ? current.mixer.timeScale : 1;
+  if (scene && playing) anim.advance(dt * speed);
+  anim.apply();
+  modelClock = scene ? anim.now() : modelClock + dt;
+  props.animateModels(modelClock);
   if (current) {
-    // the motion (re-evaluated even when paused), the face, the camera after her, then the springs
-    // on that pose. they keep running while paused, like in the game.
-    runMotion(playing ? dt : 0);
-    applyProcess();
-    applyFace();
-    current.root.updateMatrixWorld(true);
-    const cut = rootJumped();
-    if (cut) current.springs?.reset();
-    followCamera(dt, cut);
-    applyHeadTurn(dt);
-    applyEyeTrace(dt);
-    tick = current.springs?.frame(dt);
+    // per uma: the motion (re-evaluated even when paused), the face, the camera after the active
+    // one, then the springs on that pose. they keep running while paused, like in the game.
+    const ticks = [];
+    forCast(m => {
+      if (scene) { motionAt(anim.now()); faceAt(anim.now()); }
+      else runMotion(playing ? dt : 0);
+      applyProcess();
+      applyFace();
+      m.root.updateMatrixWorld(true);
+      const cut = m === active ? rootJumped() : jumped(m);
+      if (cut) m.springs?.reset();
+      if (m === active && !(scene && playing && anim.hasCamera())) followCamera(dt, cut);
+      applyHeadTurn(dt);
+      applyEyeTrace(dt);
+      const tk = m.springs?.frame(dt);
+      if (tk) ticks.push(tk);
+    });
+    tick = ticks.length ? Promise.all(ticks) : null;
     updateTime();
   }
   if (!tick) return draw();
@@ -1774,15 +2464,36 @@ async function followWarmUp() {
 
 pose.initPose({ scene, camera, canvas, controls, onPick: () => props.propsDebug.select(null) });
 props.initProps({ scene, camera, renderer, controls, canvas, current: () => current, libraryClip,
-                  idle: () => !!current && !recording && !pointerHeld });
-initStageEdit({ scene, camera, canvas, controls, place, her: () => current?.root,
+                  members: () => cast, member: key => cast.find(m => m.key === key) || null, activeKey: () => active?.key || 'main',
+                  idle: () => !!current && !recording && !pointerHeld, onSelect: p => { if (p) anim.picked('prop'); else anim.touch(); } });
+initStageEdit({ scene, camera, canvas, controls, get place() { return place; }, her: () => current?.root,
+                members: () => cast.map(m => ({ key: m.key, spot: m.spot, root: m.root, name: m.name })),
                 onPick: () => props.propsDebug.select(null),
-                onReset: () => { if (liveStage.group) showParts(liveStage.group, stageParts()); } });
+                onReset: () => { if (liveStage.group) showParts(liveStage.group, stageParts()); },
+                pickPlace, loadPlace: loadExtraPlace, placeItem: id => liveStage.items?.find(it => it.id === id),
+                condOf, altOf, conds: CONDS, dispose: disposeGroup, onExtras: () => { extrasChanged(); anim.touch(); },
+                onPicked: o => { if (o) anim.picked('stage'); else anim.touch(); } });
+anim.initAnim({ camera, controls, get place() { return place; }, stagePicked, partLabel, placeId: () => liveStage.id, stageGroup: () => liveStage.group,
+                spotOf: key => cast.find(m => m.key === key)?.spot || null, keyOfSpot: o => cast.find(m => m.spot === o)?.key || null,
+                activeMember: () => active && { key: active.key, name: active.name, clip: poseKey, title: poseTitle, face: active.facePicked },
+                selectedProp: props.selectedProp, propByKey: props.propByKey, propLabel: p => props.propLabel(p),
+                onChange: animChanged, onSeek: () => updateTime() });
+
+/** Keys added or taken away: the timeline and the video length follow. */
+function animChanged() {
+  const scene = anim.active();
+  $('#vidLen .chip[data-len="loop"]').textContent = scene ? 'Animation' : 'Full pose';
+  $('#vidLen .chip[data-len="loop"]').title = scene ? 'The whole animation, from the start' : 'The whole pose, once';
+  if (scene && current?.action && !playing) motionAt(anim.now());
+  updateTime();
+}
+animChanged();
 
 window.studio = { scene, camera, controls, setCamera, setFace, savePNG, recordVideo, exportModel, chooseUma, get charas() { return charas; },
-                  get current() { return current; }, video, shot, props: props.propsDebug, pose: pose.poseDebug, bgPic,
+                  get current() { return current; }, video, shot, props: props.propsDebug, pose: pose.poseDebug, bgPic, anim: anim.animDebug,
+                  exportBlender, renderBlender, get cast() { return cast; },
                   // for scripted shots: pause the live loop and pose / render frames by hand
-                  script: { renderFrame, libraryClip, ownClip, applyFace, applyProcess, faceState, updateProps: props.updateProps, TICK,
+                  script: { renderFrame, libraryClip, ownClip, importedClip, playClip, applyFace, applyProcess, faceState, updateProps: props.updateProps, TICK,
                             freeze(on) { recording = on ? { cancel: false } : null; } } };
 background();
 resize();

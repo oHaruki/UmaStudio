@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
-import { $, $$, store, radio, typing, endDragOnRelease } from '/static/ui.js';
+import { $, $$, store, radio, typing, endDragOnRelease, toast } from '/static/ui.js';
 
 // editing a place: with "Edit the place" on, a part of it (the screen, a speaker, an LED wall...) can
 // be moved, turned, resized or hidden, or she can be stood somewhere on it. parts are picked from
@@ -9,10 +9,18 @@ import { $, $$, store, radio, typing, endDragOnRelease } from '/static/ui.js';
 // thing behind. a part is a piece of one of the place's prefabs, "whole group" takes the prefab.
 // everything is kept per place by node name (the loader keeps those unique), her spot too. with
 // no place showing she goes back to the origin.
+//
+// other places can be added in to build with (a racecourse's stands propped up on Tracen's school
+// building): each comes in as one group, its nodes renamed x<key>:... so names stay unique even
+// with the same place in twice (once in winter, once in summer). their skies start hidden.
+//
+// with several umas in the scene each has her own spot: the first one's is kept as `her` (as it
+// always was), the others' under `hers` by their key.
 
 let ctx = null, tc = null, box = null, hoverBox = null;
 let group = null, base = null, placeId = '', shown = false, active = false;
 let picked = null;               // a part, or ctx.place for her
+let loadToken = 0;               // bumps when the place changes, late added places get dropped
 let hovered = null;
 const open = new Set();          // outliner groups folded open
 const raycaster = new THREE.Raycaster();
@@ -21,22 +29,29 @@ const allEdits = () => store.get('stageEdits', {});
 function edits() {
   const all = allEdits();
   // concert stages were saved by number before there were other places
-  return all[placeId] || all[placeId.replace(/^live:/, '')] || { parts: {}, her: null };
+  const e = all[placeId] || all[placeId.replace(/^live:/, '')] || {};
+  return { parts: {}, her: null, hers: {}, extras: [], ...e };
 }
 function putEdits(e) {
   const all = allEdits();
   delete all[placeId.replace(/^live:/, '')];
-  if (Object.keys(e.parts).length || e.her) all[placeId] = e;
+  if (Object.keys(e.parts).length || e.her || Object.keys(e.hers).length || e.extras.length) all[placeId] = e;
   else delete all[placeId];
   store.set('stageEdits', all);
 }
 
-const isHer = o => o === ctx.place;
+const memberOf = o => ctx.members().find(m => m.spot === o) || null;
+const isHer = o => !!o && (o === ctx.place || !!memberOf(o));
+const isFirst = o => ctx.members()[0]?.spot === o;
+const isExtra = o => !!o?.userData.extra;
+// the nodes whose children are prefabs: the place itself and each added place
+const isRoot = o => !!o && (o === base || isExtra(o));
+const bare = n => n.replace(/^x[a-z0-9]+:/, '');
 const restOf = o => o.userData.rest ??= { p: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone() };
 
 /** The part a picked mesh belongs to: the node right under its prefab. */
 function partOf(o) {
-  while (o.parent && o.parent !== base && o.parent.parent !== base) o = o.parent;
+  while (o.parent && !isRoot(o.parent) && !isRoot(o.parent.parent)) o = o.parent;
   return o;
 }
 
@@ -47,16 +62,21 @@ function shownInView(o) {
 
 /** A readable name: no prefab prefix, no copy number the loader added, spaces. */
 function label(o) {
-  if (isHer(o)) return 'her';
-  let n = o.name;
+  if (isHer(o)) return memberOf(o)?.name || 'her';
+  if (isExtra(o)) return '+ ' + o.userData.extra.name;
+  let n = bare(o.name);
   const m = n.match(/^(.*)_\d+$/);
-  if (m && o.parent && o.parent.name === m[1]) n = m[1];
+  if (m && o.parent && bare(o.parent.name) === m[1]) n = m[1];
   return n.replace(/^(pfb|mdl)_env_[a-z]+\d*_/, '').replace(/^pfb_/, '').replace(/_/g, ' ');
 }
 
 function remember(o) {
   const e = edits();
-  if (isHer(o)) e.her = { p: o.position.toArray(), ry: o.rotation.y };
+  if (isHer(o)) {
+    const spot = { p: o.position.toArray(), ry: o.rotation.y };
+    if (isFirst(o) || !memberOf(o)) e.her = spot;
+    else e.hers[memberOf(o).key] = spot;
+  }
   else {
     const r = restOf(o);
     const same = o.visible && o.position.equals(r.p) && o.quaternion.equals(r.q) && o.scale.equals(r.s);
@@ -75,8 +95,9 @@ function setVisible(o, on) {
 
 function pick(o) {
   picked = o;
-  if (o && !isHer(o) && o.parent !== base) open.add(o.parent);
+  for (let p = o && !isHer(o) ? o.parent : null; p && p !== base; p = p.parent) open.add(p);
   if (o) { tc.attach(o); ctx.onPick?.(); } else tc.detach();
+  ctx.onPicked?.(o);
   const her = !!o && isHer(o);
   // she turns about the vertical only and keeps her size
   tc.showX = tc.showZ = !(her && tc.mode === 'rotate');
@@ -123,26 +144,29 @@ function row(o, depth, kids) {
   return r;
 }
 
+// what a row folds open to: an added place its prefabs, a prefab its parts
+const kidsOf = o => isRoot(o) ? o.children : isRoot(o.parent) && o.children.length > 1 ? o.children : [];
+
 function fillTree() {
   const tree = $('#stageTree');
   tree.innerHTML = '';
   if (!base || !active) return;
   const find = $('#stageFind').value.trim().toLowerCase();
   const frag = document.createDocumentFragment();
-  const parts = g => g.children;
-  if (find) {
-    // a flat list of whatever matches, groups and parts
-    for (const g of base.children) {
-      if (label(g).toLowerCase().includes(find)) frag.appendChild(row(g, 0, parts(g).length > 1 ? parts(g).length : 0));
-      if (parts(g).length > 1) for (const p of parts(g)) if (label(p).toLowerCase().includes(find)) frag.appendChild(row(p, 1, 0));
+  const walk = (list, depth) => {
+    for (const o of list) {
+      const kids = kidsOf(o);
+      if (find) {
+        // a flat list of whatever matches, groups and parts
+        if (label(o).toLowerCase().includes(find)) frag.appendChild(row(o, 0, kids.length));
+        walk(kids, 0);
+      } else {
+        frag.appendChild(row(o, depth, kids.length));
+        if (kids.length && open.has(o)) walk(kids, depth + 1);
+      }
     }
-  } else {
-    for (const g of base.children) {
-      const kids = parts(g);
-      frag.appendChild(row(g, 0, kids.length > 1 ? kids.length : 0));
-      if (kids.length > 1 && open.has(g)) for (const p of kids) frag.appendChild(row(p, 1, 0));
-    }
-  }
+  };
+  walk(base.children, 0);
   if (!frag.childNodes.length) tree.innerHTML = '<div class="hint">Nothing matches.</div>';
   tree.appendChild(frag);
 }
@@ -152,6 +176,8 @@ function refresh() {
   $('#stagePick').textContent = picked ? label(picked) : 'nothing';
   $('#stageUp').disabled = !picked || her || picked.parent === base;
   $('#stageHide').disabled = !picked || her;
+  $('#stageHide').textContent = isExtra(picked) ? 'Remove' : 'Hide';
+  fillExtraConds();
   $('#stagePartReset').disabled = !picked;
   $('#stageModes .chip[data-mode="scale"]').disabled = her;
   const n = Object.values(edits().parts).filter(p => !p.v).length;
@@ -169,11 +195,127 @@ function setActive(on) {
   refresh();
 }
 
-/** Her spot on this place while it shows, the origin otherwise. */
+/** Their spots on this place while it shows; the first uma goes to the origin otherwise, the
+ *  others stay where they are. */
 function placeHer() {
-  const her = shown && group ? edits().her : null;
-  ctx.place.position.fromArray(her ? her.p : [0, 0, 0]);
-  ctx.place.rotation.set(0, her ? her.ry : 0, 0);
+  const e = shown && group ? edits() : null;
+  ctx.members().forEach((m, i) => {
+    const her = e ? (i === 0 ? e.her : e.hers[m.key]) : null;
+    if (her) {
+      m.spot.position.fromArray(her.p);
+      m.spot.rotation.set(0, her.ry, 0);
+    } else if (i === 0) {
+      m.spot.position.set(0, 0, 0);
+      m.spot.rotation.set(0, 0, 0);
+    }
+  });
+}
+
+// --- added places -------------------------------------------------------------------------------
+
+/** Saved moves and hiding put back on the nodes under root. */
+function applyEdits(root) {
+  for (const [name, p] of Object.entries(edits().parts)) {
+    const o = root.getObjectByName(name);
+    if (!o) continue;
+    o.visible = p.v;
+    o.userData.userHidden = !p.v;
+    o.position.fromArray(p.p);
+    o.quaternion.fromArray(p.q);
+    o.scale.fromArray(p.s);
+  }
+}
+
+async function loadExtra(ex, fresh) {
+  const token = loadToken;
+  const { group: g, item } = await ctx.loadPlace(ex.id, ex.cond, ex.alt);
+  if (token !== loadToken || !base) { ctx.dispose(g); return null; }
+  const root = g.children.length === 1 ? g.children[0] : g;
+  root.removeFromParent();
+  root.traverse(o => { if (o !== root) o.name = `x${ex.key}:` + o.name; });
+  root.name = 'x' + ex.key;
+  root.userData.extra = { ...ex, name: item.name };
+  base.add(root);
+  root.traverse(o => restOf(o));
+  if (fresh) {
+    // two skies inside each other fight: the one of the place it's added to stays
+    for (const pre of root.children) {
+      if (!/sky|cloud/i.test(pre.name)) continue;
+      pre.visible = false;
+      pre.userData.userHidden = true;
+      remember(pre);
+    }
+  }
+  applyEdits(root);
+  ctx.onExtras();
+  return root;
+}
+
+function dropExtra(root) {
+  if (picked && (picked === root || root.getObjectById(picked.id))) pick(null);
+  if (hovered && (hovered === root || root.getObjectById(hovered.id))) hover(null);
+  root.removeFromParent();
+  ctx.dispose(root);
+  ctx.onExtras();
+}
+
+async function addExtra() {
+  if (!base) return;
+  const id = await ctx.pickPlace('Add a place to this one');
+  if (!id) return;
+  const ex = { key: Date.now().toString(36), id, cond: ctx.condOf(id), alt: ctx.altOf(id) };
+  const e = edits();
+  e.extras.push(ex);
+  putEdits(e);
+  const root = await loadExtra(ex, true).catch(err => { removeExtra(ex.key); throw err; });
+  if (root) { open.add(root); pick(root); }
+}
+
+/** An added place taken out again, with everything saved about it. */
+function removeExtra(key) {
+  const e = edits();
+  e.extras = e.extras.filter(x => x.key !== key);
+  for (const name of Object.keys(e.parts)) if (name.startsWith(`x${key}:`) || name === 'x' + key) delete e.parts[name];
+  putEdits(e);
+  const root = base?.children.find(o => o.name === 'x' + key);
+  if (root) dropExtra(root);
+  refresh();
+}
+
+/** Season, weather, time and version of the picked added place: changing one reloads it where it is. */
+function fillExtraConds() {
+  const line = $('#extraConds');
+  const root = isExtra(picked) ? picked : null;
+  const item = root && ctx.placeItem(root.userData.extra.id);
+  const alts = item?.alts || [];
+  if (!item || !(item.axes.some(a => a.length) || alts.length > 1)) { line.style.display = 'none'; return; }
+  line.style.display = '';
+  const ex = root.userData.extra, sels = line.querySelectorAll('select');
+  ctx.conds.forEach(([, any, names], i) => {
+    const el = sels[i];
+    el.innerHTML = '';
+    el.add(new Option(any, 0));
+    for (const v of item.axes[i]) el.add(new Option(names[v] || v, v));
+    el.value = ex.cond[i];
+    el.style.display = item.axes[i].length ? '' : 'none';
+  });
+  sels[3].innerHTML = '';
+  alts.forEach((a, i) => sels[3].add(new Option(`Version ${i + 1}`, a)));
+  sels[3].value = alts.includes(ex.alt) ? ex.alt : alts[0] || '';
+  sels[3].style.display = alts.length > 1 ? '' : 'none';
+  sels.forEach(el => {
+    el.onchange = async () => {
+      const e = edits();
+      const saved = e.extras.find(x => x.key === ex.key);
+      if (!saved) return;
+      saved.cond = [0, 1, 2].map(i => +sels[i].value);
+      saved.alt = sels[3].value || null;
+      putEdits(e);
+      dropExtra(root);
+      const again = await loadExtra(saved, false).catch(err => { toast(err.message, true); return null; });
+      if (again) pick(again);
+    };
+  });
 }
 
 /** A place was loaded: its saved changes go back on. */
@@ -185,20 +327,22 @@ export function stageLoaded(g, id) {
   // the model's own root node holds the prefabs
   base = g.children.length === 1 ? g.children[0] : g;
   placeId = id;
-  const e = edits();
+  loadToken++;
   g.traverse(o => restOf(o));
-  for (const [name, p] of Object.entries(e.parts)) {
-    const o = g.getObjectByName(name);
-    if (!o) continue;
-    o.visible = p.v;
-    o.userData.userHidden = !p.v;
-    o.position.fromArray(p.p);
-    o.quaternion.fromArray(p.q);
-    o.scale.fromArray(p.s);
-  }
+  applyEdits(g);
   placeHer();
   setActive($('#stageEdit').checked);
+  // the added places come in one by one after
+  (async () => {
+    for (const ex of edits().extras) {
+      await loadExtra(ex, false).catch(err => toast(err.message, true));
+      refresh();
+    }
+  })();
 }
+
+/** An uma joined the scene: she goes to her spot on this place. */
+export function placeCast() { if (ctx) placeHer(); }
 
 /** The place showing or not (the background changed). */
 export function stageShown(on) {
@@ -207,6 +351,10 @@ export function stageShown(on) {
   placeHer();
   setActive($('#stageEdit').checked);
 }
+
+/** What's picked in the place editor (ctx.place for her), for keying. */
+export const stagePicked = () => (active ? picked : null);
+export const partLabel = o => label(o);
 
 /** Every frame before drawing: the outlines round what's picked and what the pointer is over. */
 export function updateStageEdit() {
@@ -251,9 +399,10 @@ export function initStageEdit(c) {
     const r = ctx.canvas.getBoundingClientRect();
     raycaster.setFromCamera(new THREE.Vector2((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1), ctx.camera);
     const found = [];
-    const herRoot = ctx.her();
-    const herHit = herRoot ? raycaster.intersectObject(herRoot, true).find(h => shownInView(h.object)) : null;
-    if (herHit) found.push({ o: ctx.place, d: herHit.distance, glow: false });
+    for (const m of ctx.members()) {
+      const hit = raycaster.intersectObject(m.root, true).find(h => shownInView(h.object));
+      if (hit) found.push({ o: m.spot, d: hit.distance, glow: false });
+    }
     for (const h of raycaster.intersectObject(group, true)) {
       if (!h.object.isMesh || !shownInView(h.object) || h.object.renderOrder <= -10) continue;
       found.push({ o: partOf(h.object), d: h.distance, glow: h.object.material.blending === THREE.AdditiveBlending });
@@ -311,6 +460,7 @@ export function initStageEdit(c) {
   $('#stageUp').onclick = () => { if (picked && !isHer(picked) && picked.parent !== base) pick(picked.parent); };
   $('#stageHide').onclick = () => {
     if (!picked || isHer(picked)) return;
+    if (isExtra(picked)) { removeExtra(picked.userData.extra.key); return; }
     const o = picked;
     pick(null);
     setVisible(o, false);
@@ -332,9 +482,12 @@ export function initStageEdit(c) {
       if (o) setVisible(o, true);
     }
   };
+  $('#stageAddPlace').onclick = () => addExtra().catch(err => toast(err.message, true));
   $('#stageResetAll').onclick = () => {
     if (!group) return;
     pick(null);
+    // added places go too
+    for (const root of base.children.filter(isExtra)) dropExtra(root);
     group.traverse(o => {
       const r = o.userData.rest;
       if (r) { o.position.copy(r.p); o.quaternion.copy(r.q); o.scale.copy(r.s); }
@@ -344,7 +497,7 @@ export function initStageEdit(c) {
       const o = group.getObjectByName(name);
       if (o) { o.visible = true; o.userData.userHidden = false; }
     }
-    putEdits({ parts: {}, her: null });
+    putEdits({ parts: {}, her: null, hers: {}, extras: [] });
     ctx.onReset?.();
     placeHer();
     refresh();

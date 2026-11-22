@@ -82,7 +82,18 @@ export class GameSprings {
     for (const p of this.parents) { this.modelSpace(p); uPos(_p, a, o); uQuat(_q, a, o + 3); o += 7; }
     for (const r of this.roots) { uPos(r.position, a, o); o += 3; }
     for (const b of this.bones) { uQuat(b.quaternion, a, o); o += 4; }
-    const res = await fetch(`/api/spring/step?id=${this.id}`, { method: 'POST', headers: { 'X-Studio': '1' }, body: a.buffer });
+    // long bakes send thousands of these; windows can run out of socket buffers for a moment
+    let res;
+    for (let tries = 1; ; tries++) {
+      try {
+        res = await fetch(`/api/spring/step?id=${this.id}${this.skirt === false ? '&skirt=0' : ''}`,
+                          { method: 'POST', headers: { 'X-Studio': '1' }, body: a.buffer });
+        break;
+      } catch (e) {
+        if (tries >= 8) throw e;
+        await new Promise(r => setTimeout(r, 150 * tries));
+      }
+    }
     if (res.status === 410) { this.dead = true; return; }
     if (!res.ok) throw new Error('physics step failed');
     const r = new Float32Array(await res.arrayBuffer());

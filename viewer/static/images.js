@@ -95,7 +95,16 @@ async function fill() {
   }
 }
 
+let modelHandler = null;
+/** What happens to .glb models dropped on the window. */
+export function onModelDropped(fn) { modelHandler = fn; }
+
 async function takeFiles(files) {
+  const models = files.filter(f => /\.glb$/i.test(f.name));
+  if (models.length && modelHandler) {
+    modelHandler(models);
+    if (models.length === files.length) return;
+  }
   files = files.filter(f => /^image\/(png|jpeg|webp|gif)$/.test(f.type));
   if (!files.length) return toast('Use a PNG, JPG, WebP or GIF picture', true);
   let url;

@@ -615,7 +615,7 @@ class Simulation:
             return 1.0 - (far - distance) / (far - main.get("HipMoveInfluenceDistance", 0.0))
         return 0.0
 
-    def tick(self, parents, root_pos, local_rot, hip, dt=TICK, reset=False):
+    def tick(self, parents, root_pos, local_rot, hip, dt=TICK, reset=False, skirt=True):
         """One BeginSimulation/EndSimulation. parents: (pos, rot) per work node; root_pos:
         each root's local position; local_rot: every bone's local rotation now (the
         animation, or what the last tick left). Returns the bones' final rotations (model
@@ -652,7 +652,7 @@ class Simulation:
             rest = (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, True, 1.0, True, main_rate, add_rate, 1.0)
             for root in part.roots:
                 sk = root.skirt
-                if sk is None or self.skirt_arg is None:
+                if sk is None or self.skirt_arg is None or not skirt:
                     self.dll.NativeClothUpdate(root.buf, root.count, cols, self.work_buf, *rest)
                     continue
                 # the panel as the animation has it: root where the solver has it, target
@@ -676,13 +676,13 @@ class Simulation:
                         out.append(get4(root.buf, b.index * WORK + FINAL_ROT))
         return out
 
-    def run(self, parents, root_pos, local_rot, hip, ticks=1, dt=TICK, reset=False):
+    def run(self, parents, root_pos, local_rot, hip, ticks=1, dt=TICK, reset=False, skirt=True):
         """`ticks` simulation steps on one pose (more than one = the game's warm-up, where the
         animation does not move and each step starts from what the last one left)."""
         local_rot = list(local_rot)
         out = None
         for t in range(max(1, ticks)):
-            out = self.tick(parents, root_pos, local_rot, hip, dt, reset and t == 0)
+            out = self.tick(parents, root_pos, local_rot, hip, dt, reset and t == 0, skirt)
             if t + 1 < ticks:
                 self.relocal(parents, out, local_rot)
         return out
@@ -698,10 +698,11 @@ class Simulation:
                 local_rot[k] = qmul(qinv(pq), finals[k])
             world[b.node] = qmul(pq, local_rot[k])
 
-    def step(self, raw):
+    def step(self, raw, skirt=True):
         """run() from the viewer's packed floats: dt, ticks, reset, hip xyz, then each
         parent's position + rotation, each root's local position, each bone's local
-        rotation. Answers per bone: applied (0/1) and the final rotation."""
+        rotation. Answers per bone: applied (0/1) and the final rotation. skirt=False skips the
+        skirt rule (sitting: raised knees would swing the panels out flat)."""
         a = array.array("f")
         a.frombytes(raw)
         nw, nr, nb = len(self.work_nodes), len(self.roots), len(self.bones)
@@ -713,7 +714,7 @@ class Simulation:
         root_pos = [tuple(a[o + 3 * k:o + 3 * k + 3]) for k in range(nr)]
         o += nr * 3
         local_rot = [tuple(a[o + 4 * k:o + 4 * k + 4]) for k in range(nb)]
-        out = self.run(parents, root_pos, local_rot, tuple(a[3:6]), ticks=int(a[1]), dt=a[0], reset=a[2] > 0.5)
+        out = self.run(parents, root_pos, local_rot, tuple(a[3:6]), ticks=int(a[1]), dt=a[0], reset=a[2] > 0.5, skirt=skirt)
         res = array.array("f", [0.0] * (nb * 5))
         for k, q in enumerate(out):
             if q is not None:

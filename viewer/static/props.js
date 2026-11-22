@@ -1,19 +1,22 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
-import { kindOf, makeMaterial, makeOutline } from '/static/look.js';
-import { $, $$, post, getJson, toast, store, radio, typing, busy, showTab, endDragOnRelease } from '/static/ui.js';
-import { pickImage, pictureName, onPictureDropped } from '/static/images.js';
+import { U, kindOf, makeMaterial, makeOutline } from '/static/look.js';
+import { $, $$, call, post, getJson, toast, store, radio, typing, busy, showTab, endDragOnRelease } from '/static/ui.js';
+import { pickImage, pictureName, onPictureDropped, onModelDropped } from '/static/images.js';
 
-// props: the game's hand props, or one of your pictures as a card or a box, held by the Uma.
-// a picture can also replace a game prop's texture.
+// props: the game's hand props, one of your pictures as a card or a box, or a .glb model from
+// anywhere, held by the Uma or standing around. a picture can also replace a prop's texture.
 //
 // props live outside the character's node tree (their bones would clash with hers by name)
 // and follow an anchor every frame: a hand's attach bone (where the game puts props), the
-// point between both hands, the head, the chest, or the floor.
+// point between both hands, the head, the chest, or the floor. with several umas in the scene
+// each prop belongs to one of them (p.owner, her key).
 
 const BONES = { right: 'Hand_Attach_R', left: 'Hand_Attach_L', head: 'Head', chest: 'Chest' };
-const KIND_LABEL = { game: 'Prop', card: 'Picture card', box: 'Picture box' };
+const KIND_LABEL = { game: 'Prop', card: 'Picture card', box: 'Picture box', model: 'Model' };
+// game props and models come as loaded meshes with their own materials, cards and boxes are made here
+const isMeshy = p => p.kind === 'game' || p.kind === 'model';
 
 let ctx = null;              // from the viewer: scene, camera, renderer, controls, canvas, current(), libraryClip()
 const group = new THREE.Group();
@@ -23,13 +26,16 @@ let tc = null;
 let uid = 0;
 let outlinesOn = true;
 let restored = false;
-const restInv = new Map();   // bone name -> inverse of its world rotation at rest
 const loader = new GLTFLoader();
 const raycaster = new THREE.Raycaster();
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _s = new THREE.Vector3(), _m = new THREE.Matrix4();
 const _x = new THREE.Vector3(), _y = new THREE.Vector3(), _z = new THREE.Vector3(), _b = new THREE.Box3();
 const UP = new THREE.Vector3(0, 1, 0);
+
+// models keeping their own materials need light, nothing else here uses three's lights
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+const sky = new THREE.HemisphereLight(0xffffff, 0x8a8078, 1.4);
 
 // --- anchors ---------------------------------------------------------------------------
 
@@ -67,24 +73,39 @@ function placeAnchor(p, cur) {
   const name = BONES[p.anchor], b = bone(cur, name);
   if (!b) { a.position.set(0, 0, 0); a.quaternion.identity(); return; }
   b.matrixWorld.decompose(a.position, a.quaternion, _s);
-  if (!usesBoneFrame(p) && restInv.has(name)) a.quaternion.multiply(restInv.get(name));
+  if (!usesBoneFrame(p) && cur.restInv?.has(name)) a.quaternion.multiply(cur.restInv.get(name));
 }
 
 /** Every frame, after motion, face and physics. */
+/** The uma a prop belongs to (the active one if hers isn't loaded). */
+const ownerOf = p => ctx.member(p.owner) || ctx.current();
+
 export function updateProps() {
   if (!list.length) return;
-  const cur = ctx.current();
-  cur?.root.updateMatrixWorld(true);
-  for (const p of list) placeAnchor(p, cur);
+  for (const m of ctx.members()) m.root.updateMatrixWorld(true);
+  for (const p of list) placeAnchor(p, ownerOf(p));
+  sun.position.copy(U.lightDir.value).multiplyScalar(10);
+}
+
+/** The models' own animations (wings flapping...) at time t in seconds, looping. */
+export function animateModels(t) {
+  for (const p of list) {
+    if (!p.mixer || !p.action) continue;
+    const d = p.action.getClip().duration || 1;
+    p.action.time = ((t % d) + d) % d;
+    p.mixer.update(0);
+  }
 }
 
 /** A new character (or outfit) is loaded, still at rest. */
 export function onModel(cur) {
-  restInv.clear();
+  // bone name -> inverse of its world rotation at rest (with her spot taken out)
+  cur.restInv = new Map();
   cur.root.updateMatrixWorld(true);
+  const spot = cur.root.parent ? cur.root.parent.getWorldQuaternion(new THREE.Quaternion()) : new THREE.Quaternion();
   for (const name of Object.values(BONES)) {
     const b = bone(cur, name);
-    if (b) restInv.set(name, b.getWorldQuaternion(new THREE.Quaternion()).invert());
+    if (b) cur.restInv.set(name, spot.clone().invert().multiply(b.getWorldQuaternion(new THREE.Quaternion())).invert());
   }
   if (!restored) {
     restored = true;
@@ -97,20 +118,21 @@ export function onModel(cur) {
 // many props have a hand motion of their own (fingers and attach point only). it plays on top
 // of the pose with a far larger weight, so it wins on those bones and nowhere else.
 
-let gripSeq = 0;
 export async function applyGrips() {
-  const cur = ctx.current();
-  if (!cur) return;
-  const my = ++gripSeq;
+  await Promise.all(ctx.members().map(gripsFor));
+}
+
+async function gripsFor(cur) {
+  const my = cur.gripSeq = (cur.gripSeq || 0) + 1;
   const want = [];
   for (const p of list) {
-    if (p.kind !== 'game' || !p.grip || !p.visible) continue;
+    if (p.kind !== 'game' || !p.grip || !p.visible || ownerOf(p) !== cur) continue;
     const path = p.anchor === 'right' ? p.info.grip : p.anchor === 'left' ? p.info.gripLeft : null;
     if (path && !want.includes(path)) want.push(path);
   }
   let clips = [];
-  try { clips = await Promise.all(want.map(w => ctx.libraryClip(w))); } catch (e) { toast(e.message, true); }
-  if (my !== gripSeq || cur !== ctx.current()) return;
+  try { clips = await Promise.all(want.map(w => ctx.libraryClip(w, cur))); } catch (e) { toast(e.message, true); }
+  if (my !== cur.gripSeq || !ctx.members().includes(cur)) return;
   for (const a of cur.grips || []) {
     a.stop();
     for (const t of a.getClip().tracks) {
@@ -226,6 +248,94 @@ async function loadGame(name, quiet) {
   return { info, root: gltf.scene, meshes, orig };
 }
 
+// --- loading your models -------------------------------------------------------------------------
+
+/** A 1x1 texture of a colour, for untextured parts going through the toon shader. */
+const swatches = new Map();
+function swatch(color) {
+  const k = color.getHexString();
+  if (!swatches.has(k)) {
+    const t = new THREE.DataTexture(new Uint8Array([color.r * 255, color.g * 255, color.b * 255, 255]), 1, 1);
+    t.needsUpdate = true;
+    swatches.set(k, t);
+  }
+  return swatches.get(k);
+}
+
+async function loadModel(file) {
+  const gltf = await loader.loadAsync('/models/' + encodeURIComponent(file));
+  const meshes = [];
+  gltf.scene.traverse(o => { if (o.isMesh) meshes.push(o); });
+  const orig = new Map();
+  for (const m of meshes) {
+    const mat = Array.isArray(m.material) ? m.material[0] : m.material;
+    m.material = mat;
+    // no environment to reflect here: fully metal parts would come out black
+    if ('metalness' in mat) mat.metalness = Math.min(mat.metalness, 0.4);
+    const cut = mat.alphaTest > 0 || mat.transparent;
+    const map = mat.map || null;
+    if (map) map.colorSpace = THREE.NoColorSpace;   // the toon shader writes values as they are
+    const main = map || swatch(mat.color ? mat.color.clone().convertLinearToSRGB() : new THREE.Color(1, 1, 1));
+    orig.set(m, { geometry: m.geometry, material: mat, own: mat, ud: {}, tex: { _MainTex: main }, cut });
+    m.frustumCulled = false;
+  }
+  let mixer = null;
+  if (gltf.animations.length) mixer = new THREE.AnimationMixer(gltf.scene);
+  // her toon shader has no morph targets or vertex colours: models built on those get three's toon
+  // material (it has both) instead
+  for (const m of meshes) {
+    const o = orig.get(m);
+    o.three = !!(m.morphTargetInfluences?.length || (m.geometry.attributes.color && !m.material.map));
+    // models without normals are lit flat by their own material; the toon ones need them
+    if (!m.geometry.attributes.normal) m.geometry.computeVertexNormals();
+  }
+  const own = meshes.some(m => orig.get(m).three);
+  return { root: gltf.scene, meshes, orig, mixer, clips: gltf.animations, own };
+}
+
+/** A model's box as it shows (morphs and bones posed), in the holder's space. */
+function modelBounds(root) {
+  root.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root, true);
+  return { center: box.getCenter(new THREE.Vector3()), size: box.getSize(new THREE.Vector3()) };
+}
+
+/** Sketchfab models come in any size, centimetres or kilometres: sensible ones keep theirs.
+ *  Measured on the first frame of its animation, a morphed model's rest shape can be far off. */
+function fitModel(p, root) {
+  let box = modelBounds(root);
+  const big = Math.max(box.size.x, box.size.y, box.size.z);
+  if (big > 0 && (big > 4 || big < 0.05)) {
+    root.scale.multiplyScalar(1 / big);
+    box = modelBounds(root);
+  }
+  p.box = box;
+}
+
+// three bands of light, like her shading
+let stepTex = null;
+function steps() {
+  if (!stepTex) {
+    stepTex = new THREE.DataTexture(new Uint8Array([110, 110, 110, 255, 190, 190, 190, 255, 255, 255, 255, 255]), 3, 1);
+    stepTex.minFilter = stepTex.magFilter = THREE.NearestFilter;
+    stepTex.needsUpdate = true;
+  }
+  return stepTex;
+}
+
+/** Which of the model's animations plays (-1: none). */
+function setClip(p, i) {
+  p.clip = i;
+  if (!p.mixer) return;
+  p.mixer.stopAllAction();
+  p.action = null;
+  if (i >= 0 && p.clips[i]) {
+    p.action = p.mixer.clipAction(p.clips[i]);
+    p.action.play();
+  }
+  p.mixer.update(0);
+}
+
 /** The prop's bounding box in its own space, as loaded. */
 function bounds(g) {
   g.root.updateMatrixWorld(true);
@@ -242,8 +352,10 @@ function disposeGame(g) {
   for (const [, o] of g.orig || []) {
     o.geometry.dispose();
     o.material.dispose();
-    Object.values(o.tex).forEach(t => t.dispose());
+    if (o.own && o.material !== o.own) o.own.dispose();
+    Object.values(o.tex).forEach(t => { if (![...swatches.values()].includes(t)) t.dispose(); });
   }
+  g.mixer?.stopAllAction();
 }
 
 // --- thumbnails ---------------------------------------------------------------------------
@@ -397,13 +509,13 @@ function defaultPlacement(p) {
   h.position.set(0, 0, 0);
   h.quaternion.identity();
   h.scale.set(1, 1, 1);
-  if (p.kind === 'game') {
+  if (isMeshy(p)) {
     if (usesBoneFrame(p)) return;   // in a hand: exactly where the game puts it
-    // elsewhere by its bounding box: hands a little below its middle, on top of the head, in
-    // front of the chest, standing on the floor.
+    // elsewhere by its bounding box: one hand round its middle, both hands a little below it, on
+    // top of the head, in front of the chest, standing on the floor.
     const c = p.box.center, sz = p.box.size;
-    const at = { both: [0, sz.y * 0.1, 0.02], head: [0, 0.24 + sz.y / 2, 0], chest: [0, 0, 0.13 + sz.z / 2],
-                 floor: [0.45, sz.y / 2, 0.1] }[p.anchor];
+    const at = { right: [0, 0, 0], left: [0, 0, 0], both: [0, sz.y * 0.1, 0.02], head: [0, 0.24 + sz.y / 2, 0],
+                 chest: [0, 0, 0.13 + sz.z / 2], floor: [0.45, sz.y / 2, 0.1] }[p.anchor] || [0, 0, 0];
     h.position.set(at[0] - c.x, at[1] - c.y, at[2] - c.z);
     return;
   }
@@ -416,15 +528,19 @@ function defaultPlacement(p) {
   h.position.set(...at);
 }
 
-/** kind: 'game' (opts.name), 'card' or 'box' (opts.image). Saved props pass their state. */
+/** kind: 'game' (opts.name), 'card' or 'box' (opts.image), 'model' (opts.name = your .glb file).
+ *  Saved props pass their state. */
 export function add(kind, opts = {}, quiet = false) {
-  return busy(quiet ? 'Restoring props…' : kind === 'game' ? 'Loading prop…' : 'Loading picture…', addNow(kind, opts, quiet));
+  const what = { game: 'Loading prop…', model: 'Loading model…' }[kind] || 'Loading picture…';
+  return busy(quiet ? 'Restoring props…' : what, addNow(kind, opts, quiet));
 }
 
 async function addNow(kind, opts, quiet) {
   const p = {
-    uid: ++uid, kind, name: opts.name || null, anchor: opts.anchor || (kind === 'game' ? 'right' : 'both'),
-    image: opts.image || null, fit: opts.fit || 'sides', turn: opts.turn || 0, toon: opts.toon ?? true,
+    uid: ++uid, key: opts.key || Math.random().toString(36).slice(2, 10), kind, name: opts.name || null,
+    anchor: opts.anchor || { game: 'right', model: 'floor' }[kind] || 'both', clip: opts.clip ?? 0,
+    owner: opts.owner || ctx.activeKey(),
+    image: opts.image || null, fit: opts.fit || (kind === 'model' ? 'uv' : 'sides'), turn: opts.turn || 0, toon: opts.toon ?? true,
     grip: opts.grip ?? true, visible: opts.visible ?? true, dims: opts.dims || null, info: null,
     anchorObj: new THREE.Object3D(), holder: new THREE.Object3D(), meshes: [], outlines: [], orig: new Map(), made: [],
   };
@@ -444,10 +560,17 @@ async function addNow(kind, opts, quiet) {
       m.parent.add(ol);
       p.outlines.push(ol);
     }
+  } else if (kind === 'model') {
+    const g = await loadModel(p.name);
+    if (!g.meshes.length) throw new Error('That model has nothing to show');
+    Object.assign(p, { meshes: g.meshes, orig: g.orig, mixer: g.mixer, clips: g.clips });
+    setClip(p, p.clip);
+    fitModel(p, g.root);
+    p.holder.add(g.root);
   } else {
     if (!p.dims) {
       p.dims = kind === 'card' ? { h: 0.3 } : { w: 0.3, h: 0.22, d: 0.22 };
-      const cur = ctx.current(), l = cur && bone(cur, BONES.left), r = cur && bone(cur, BONES.right);
+      const cur = ownerOf(p), l = cur && bone(cur, BONES.left), r = cur && bone(cur, BONES.right);
       if (kind === 'box' && l && r && p.anchor === 'both') {
         // as wide as her hands are apart right now
         cur.root.updateMatrixWorld(true);
@@ -468,7 +591,7 @@ async function addNow(kind, opts, quiet) {
   group.add(p.anchorObj);
   list.push(p);
   await refreshLook(p);
-  placeAnchor(p, ctx.current());
+  placeAnchor(p, ownerOf(p));
   if (!quiet) {
     select(p);
     save();
@@ -490,7 +613,21 @@ async function refreshLook(p) {
   const old = p.made;
   p.made = [];
   const opts = { cutout: tex ? 0.5 : 0 };
-  if (p.kind === 'game') {
+  if (p.kind === 'model') {
+    // toon: through her shader with its own texture (or colour); else its own materials, lit
+    for (const m of p.meshes) {
+      const o = p.orig.get(m);
+      m.geometry = tex && p.fit === 'sides' ? made(p, boxProject(o.geometry, p.turn)) : o.geometry;
+      if (!p.toon && !tex) { m.material = o.own; continue; }
+      if (o.three && !tex) {
+        m.material = made(p, new THREE.MeshToonMaterial({ color: o.own.color, map: o.own.map, vertexColors: o.own.vertexColors,
+                                                          gradientMap: steps(), side: o.own.side, flatShading: o.own.flatShading }));
+        continue;
+      }
+      m.material = made(p, makeMaterial(p.toon ? 'body' : 'flat', o.ud, { _MainTex: tex || o.tex._MainTex },
+                                        { cutout: tex || o.cut ? 0.5 : 0, side: o.own.side }));
+    }
+  } else if (p.kind === 'game') {
     for (const m of p.meshes) {
       const o = p.orig.get(m);
       if (!tex) { m.geometry = o.geometry; m.material = o.material; continue; }
@@ -513,7 +650,7 @@ export function remove(p) {
   list.splice(list.indexOf(p), 1);
   group.remove(p.anchorObj);
   p.made.forEach(x => x.dispose());
-  if (p.kind === 'game') disposeGame(p);
+  if (isMeshy(p)) disposeGame(p);
   else p.meshes.forEach(m => m.geometry.dispose());
   if (p.kind === 'game') applyGrips();
   renderList();
@@ -522,6 +659,7 @@ export function remove(p) {
 
 function select(p) {
   selected = p;
+  ctx.onSelect?.(p);
   if (p) showTab('props');
   if (p && p.visible) tc.attach(p.holder);
   else tc.detach();
@@ -547,7 +685,8 @@ function setPicture(p, url) {
 
 function save() {
   store.set('props', list.map(p => ({
-    kind: p.kind, name: p.name, anchor: p.anchor, image: p.image, fit: p.fit, turn: p.turn, toon: p.toon, grip: p.grip,
+    key: p.key, owner: p.owner, kind: p.kind, name: p.name, anchor: p.anchor, image: p.image, fit: p.fit, turn: p.turn, toon: p.toon, grip: p.grip,
+    clip: p.clip,
     visible: p.visible, dims: p.dims, pos: p.holder.position.toArray(), quat: p.holder.quaternion.toArray(),
     scale: p.holder.scale.toArray(),
   })));
@@ -562,8 +701,9 @@ async function restore() {
 
 // --- panel ------------------------------------------------------------------------------------
 
-function propLabel(p) {
-  const base = p.kind === 'game' ? `${KIND_LABEL.game} ${p.info?.id || ''}` : KIND_LABEL[p.kind];
+export function propLabel(p) {
+  const base = p.kind === 'game' ? `${KIND_LABEL.game} ${p.info?.id || ''}`
+    : p.kind === 'model' ? p.name.replace(/\.glb$/i, '') : KIND_LABEL[p.kind];
   return p.image ? `${base} · ${pictureName(p.image)}` : base;
 }
 
@@ -599,17 +739,37 @@ function syncEditor() {
   show('#propEdit', !!p);
   if (!p) return;
   $('#propAnchor').value = p.anchor;
+  // who holds it, with more than one uma in the scene
+  const ms = ctx.members();
+  show('#propOwnerRow', ms.length > 1);
+  if (ms.length > 1) {
+    const sel = $('#propOwner');
+    sel.innerHTML = '';
+    for (const m of ms) sel.add(new Option(m.name, m.key));
+    sel.value = ownerOf(p)?.key || ms[0].key;
+  }
   $('#propPicName').textContent = p.image ? pictureName(p.image) : 'none';
   show('#propPicClear', !!p.image);
   show('#propTurn', !!p.image);
-  show('#propFitRow', p.kind === 'game' && !!p.image);
+  show('#propFitRow', isMeshy(p) && !!p.image);
   radio('#propFit .chip', $(`#propFit .chip[data-fit="${p.fit}"]`));
   show('#propToonRow', p.kind !== 'game' || !!p.image);
+  show('#propClipRow', p.kind === 'model' && p.clips?.length > 0);
+  if (p.kind === 'model' && p.clips?.length) {
+    const sel = $('#propClip');
+    sel.innerHTML = '';
+    sel.add(new Option('None', -1));
+    p.clips.forEach((c, i) => sel.add(new Option(c.name || `Animation ${i + 1}`, i)));
+    sel.value = p.clip;
+  }
   $('#propToon').checked = p.toon;
   const gripPath = p.kind === 'game' && (p.anchor === 'right' ? p.info?.grip : p.anchor === 'left' ? p.info?.gripLeft : null);
   show('#propGripRow', !!gripPath);
   $('#propGrip').checked = p.grip;
-  show('#propScaleRow', p.kind === 'game');
+  show('#propScaleRow', isMeshy(p));
+  // models can be anything from a pebble to a tank
+  $('#propScale').max = p.kind === 'model' ? 30 : 3;
+  $('#propScale').min = p.kind === 'model' ? 0.05 : 0.2;
   $('#propScale').value = (p.holder.scale.x + p.holder.scale.y + p.holder.scale.z) / 3;
   show('#propCardRow', p.kind === 'card');
   show('#propBoxRows', p.kind === 'box');
@@ -633,9 +793,43 @@ function setDims(change) {
   dimTimer = setTimeout(() => { refreshLook(p); save(); }, 40);
 }
 
+// --- your models -------------------------------------------------------------------------------
+
+async function importModels(files) {
+  let last = null;
+  for (const f of files) {
+    try {
+      const r = await call('/api/models/upload?name=' + encodeURIComponent(f.name || 'model.glb'),
+                           { method: 'POST', headers: { 'X-Studio': '1' }, body: f }, 'Importing ' + f.name + '…');
+      last = r.file;
+    } catch (e) { toast(e.message, true); }
+  }
+  return last;
+}
+
+async function openModels() {
+  $('#modelPicker').style.display = 'block';
+  const grid = $('#modelGrid');
+  grid.innerHTML = '';
+  let items = [];
+  try { items = (await getJson('/api/models')).items; } catch (e) { toast(e.message, true); }
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.className = 'tile';
+    b.innerHTML = '<span></span>';
+    b.querySelector('span').textContent = it.file.replace(/\.glb$/i, '');
+    b.onclick = () => { closeModels(); add('model', { name: it.file }).catch(e => toast(e.message, true)); };
+    grid.appendChild(b);
+  }
+  if (!items.length) grid.innerHTML = '<div class="empty">No models yet. Import a .glb (Sketchfab: Download 3D model, glTF binary) or drop one on this window.</div>';
+}
+const closeModels = () => { $('#modelPicker').style.display = 'none'; };
+
 export function initProps(c) {
   ctx = c;
   ctx.scene.add(group);
+  sun.target.position.set(0, 0, 0);
+  group.add(sun, sun.target, sky);
   tc = new TransformControls(ctx.camera, ctx.canvas);
   tc.setSize(0.75);
   tc.setSpace('local');
@@ -655,6 +849,22 @@ export function initProps(c) {
     const url = await pickImage({ title: 'Picture for the box' });
     if (url) add('box', { image: url }).catch(e => toast(e.message, true));
   };
+  $('#addModel').onclick = openModels;
+  $('#modelClose').onclick = closeModels;
+  $('#modelPicker').addEventListener('mousedown', e => { if (e.target.id === 'modelPicker') closeModels(); });
+  $('#modelImport').onclick = () => $('#modelFile').click();
+  $('#modelFolder').onclick = () => post('/api/open', { what: 'models' }).catch(() => {});
+  $('#modelFile').onchange = async () => {
+    const files = [...$('#modelFile').files];
+    $('#modelFile').value = '';
+    const file = await importModels(files);
+    if (file) { closeModels(); add('model', { name: file }).catch(e => toast(e.message, true)); }
+  };
+  onModelDropped(async files => {
+    const file = await importModels(files);
+    if (file) add('model', { name: file }).catch(e => toast(e.message, true));
+  });
+  $('#propClip').onchange = () => { setClip(selected, +$('#propClip').value); save(); };
   $('#propPickerClose').onclick = closePicker;
   $('#propPicker').addEventListener('mousedown', e => { if (e.target.id === 'propPicker') closePicker(); });
   let filterTimer;
@@ -664,9 +874,16 @@ export function initProps(c) {
     const p = selected;
     p.anchor = $('#propAnchor').value;
     defaultPlacement(p);
-    placeAnchor(p, ctx.current());
+    placeAnchor(p, ownerOf(p));
     if (p.kind === 'game') applyGrips();
     syncEditor();
+    save();
+  };
+  $('#propOwner').onchange = () => {
+    const p = selected;
+    p.owner = $('#propOwner').value;
+    placeAnchor(p, ownerOf(p));
+    applyGrips();
     save();
   };
   $('#propPic').onclick = async () => {
@@ -749,3 +966,15 @@ export async function warmThumbs(report) {
 export function exportInfo() { return { group, props: list.map(p => ({ uid: p.uid, anchor: p.anchorObj, outlines: p.outlines })) }; }
 
 export const propsDebug = { list, get selected() { return selected; }, add, remove, select };
+
+/** An uma left the scene: her props go to another. */
+export function reown(from, to) {
+  for (const p of list) if (p.owner === from) p.owner = to;
+  save();
+  applyGrips();
+}
+
+/** The selected prop, for keying. */
+export const selectedProp = () => selected;
+/** A prop by its saved key. */
+export const propByKey = key => list.find(p => p.key === key) || null;

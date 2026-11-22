@@ -44,6 +44,9 @@ BUNDLES = os.path.join(ROOT, "bundles")
 CACHE = os.path.join(ROOT, "viewer-cache")
 RENDERS = os.path.join(ROOT, "renders")
 IMAGES = os.path.join(ROOT, "images")
+MODELS = os.path.join(ROOT, "models")
+ANIMS = os.path.join(ROOT, "animations")
+BLENDER_OUT = os.path.join(ROOT, "blender")
 LIBRARY_DIR = os.path.join(CACHE, "_library")
 ICONS = os.path.join(CACHE, "_icons")
 PROPS = os.path.join(CACHE, "_props")
@@ -164,15 +167,16 @@ def spring_new(pack, nodes, body=None):
     sim = cyspring.Simulation(json.load(open(path, encoding="utf-8")), nodes, body)
     sid = uuid.uuid4().hex[:12]
     _springs[sid] = (sim, threading.Lock())
-    while len(_springs) > 4:
+    # one per uma in the scene, a few spare for rebuilds (body collisions changed...)
+    while len(_springs) > 16:
         _springs.pop(next(iter(_springs)))
     return {"id": sid, **sim.describe()}
 
 
-def spring_step(sid, raw):
+def spring_step(sid, raw, skirt=True):
     sim, lock = _springs[sid]
     with lock:
-        return sim.step(raw)
+        return sim.step(raw, skirt)
 
 
 # --- story scenes ---------------------------------------------------------------------------
@@ -425,9 +429,9 @@ def place_pieces():
         kind, place = m.group(1), m.group(2)
         if kind in SHARED and SHARED[kind] in n:
             shared[kind].append(n)
-        elif (kind == "race" and place.startswith("race0")) or (kind == "home" and not place.startswith("home")) \
+        elif (kind == "home" and not place.startswith("home")) \
                 or (kind == "set" and place == "set00000") or (kind == "mini" and place == "mini00000") or "_cutt" in n:
-            continue   # race gates and props, the jukebox, a lone prop, racecourse copies for cutscenes
+            continue   # the jukebox, a lone prop, racecourse copies for cutscenes
         else:
             out.setdefault((kind, place), []).append(n)
     for (kind, place), pieces in out.items():
@@ -542,6 +546,9 @@ def place_name(kind, place, courses, charas):
     if kind == "live":
         return f"Stage {place}"
     if kind == "race":
+        # race0xxxx: the pieces races share (starting gates, course props), each set its own place
+        if place.startswith("race0"):
+            return f"Race pieces {place[4:]}"
         return courses.get(n) or f"Racecourse {n}"
     if kind == "home":
         return "Tracen Academy" if n == 10001 else f"Tracen {n}"
@@ -678,6 +685,133 @@ def image_save(name, data):
     with open(path, "wb") as f:
         f.write(data)
     return os.path.basename(path)
+
+
+# --- your models ---------------------------------------------------------------------------------
+#
+# .glb files from anywhere (sketchfab, blender...) to use as props. one file each: a .gltf with its
+# textures beside it can't come through a single upload.
+
+def model_list(folder=MODELS):
+    out = []
+    if os.path.isdir(folder):
+        for f in os.listdir(folder):
+            if f.lower().endswith(".glb"):
+                out.append({"file": f, "time": os.path.getmtime(os.path.join(folder, f))})
+    return sorted(out, key=lambda x: -x["time"])
+
+
+def model_save(name, data, folder=MODELS):
+    if data[:4] != b"glTF":
+        raise ValueError("that file is not a .glb model (export it from Blender as glTF Binary)")
+    os.makedirs(folder, exist_ok=True)
+    stem = re.sub(r"[^\w\-. ]", "_", os.path.splitext(name)[0])[:80].strip() or "model"
+    path = unique(os.path.join(folder, f"{stem}.glb"))
+    with open(path, "wb") as f:
+        f.write(data)
+    return os.path.basename(path)
+
+
+# --- blender ---------------------------------------------------------------------------------------
+#
+# "send to blender": the page writes scene.glb, scene.json and textures into blender/<name>/, then
+# blender/uma_scene.py builds the look there and renders frames in the background; the frames
+# become an mp4 with the other videos.
+
+_blender_jobs = {}
+
+
+def find_blender():
+    """The newest blender.exe in the usual places, or None."""
+    found = []
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", "")):
+        bf = os.path.join(base, "Blender Foundation") if base else ""
+        if bf and os.path.isdir(bf):
+            for d in os.listdir(bf):
+                exe = os.path.join(bf, d, "blender.exe")
+                if os.path.exists(exe):
+                    found.append(exe)
+    for lib in gamepaths.steam_libraries() if hasattr(gamepaths, "steam_libraries") else []:
+        exe = os.path.join(lib, "steamapps", "common", "Blender", "blender.exe")
+        if os.path.exists(exe):
+            found.append(exe)
+    def version(p):
+        m = re.search(r"(\d+)\.(\d+)", os.path.basename(os.path.dirname(p)))
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return max(found, key=version) if found else (shutil.which("blender"))
+
+
+def blender_put(dirname, rel, data):
+    """One file of an export: scene.glb, scene.json or tex/<n>.png, nothing else."""
+    rel = rel.replace("\\", "/")
+    if not re.fullmatch(r"(tex/\d+\.png|scene\.glb|scene\.json)", rel):
+        raise ValueError("bad file")
+    os.makedirs(BLENDER_OUT, exist_ok=True)
+    folder = safe_join(BLENDER_OUT, re.sub(r"[^\w\-. ]", "_", dirname)[:100] or "scene")
+    path = safe_join(folder, rel) if folder else None
+    if not path:
+        raise ValueError("bad folder")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def blender_render(dirname, still=False):
+    exe = find_blender()
+    if not exe:
+        raise ValueError("Blender is not installed (get 4.2 or newer from blender.org)")
+    folder = safe_join(BLENDER_OUT, dirname)
+    if not folder or not os.path.exists(os.path.join(folder, "scene.json")):
+        raise ValueError("that export is gone")
+    script = os.path.join(HERE, "blender", "uma_scene.py")
+    args = [exe, "--background", "--python", script, "--", folder]
+    if still is not False and still is not None:
+        args += ["--still", str(int(still))]
+    total = json.load(open(os.path.join(folder, "scene.json"), encoding="utf-8")).get("frames", 1)
+    jid = uuid.uuid4().hex[:10]
+    job = {"done": False, "error": None, "progress": "", "output": None}
+    _blender_jobs[jid] = job
+
+    def run():
+        log = open(os.path.join(folder, "blender.log"), "w", encoding="utf-8", errors="replace")
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            n = 0
+            for line in proc.stdout:
+                log.write(line)
+                if line.startswith("Saved:") or "Saved: " in line:
+                    n += 1
+                    job["progress"] = f"frame {n} / {1 if still is not False else total}"
+                elif line.startswith("Fra:") and not job["progress"]:
+                    job["progress"] = "building the scene"
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError("blender stopped (see blender.log in the export folder)")
+            if still is not False:
+                job["output"] = os.path.join(folder, f"still_{int(still):04d}.png")
+            else:
+                ffmpeg = find_ffmpeg()
+                if not ffmpeg:
+                    raise RuntimeError("ffmpeg is needed to make the video: winget install ffmpeg")
+                fps = json.load(open(os.path.join(folder, "scene.json"), encoding="utf-8")).get("fps", 30)
+                frames = sorted(f for f in os.listdir(os.path.join(folder, "frames")) if f.endswith(".png"))
+                first = int(os.path.splitext(frames[0])[0]) if frames else 0
+                out = unique(os.path.join(RENDERS, os.path.basename(folder) + " (Blender).mp4"))
+                os.makedirs(RENDERS, exist_ok=True)
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-framerate", str(fps), "-start_number", str(first),
+                                "-i", os.path.join(folder, "frames", "%04d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                                "-crf", "16", "-preset", "medium", "-movflags", "+faststart", out],
+                               check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                job["output"] = out
+        except Exception as e:
+            job["error"] = str(e)
+        finally:
+            log.close()
+            job["done"] = True
+
+    threading.Thread(target=run, daemon=True).start()
+    return jid
 
 
 # --- warm-up ----------------------------------------------------------------------------------
@@ -1010,6 +1144,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "items": image_list()})
             if p.startswith("/img/"):
                 return self._file(safe_join(IMAGES, p[len("/img/"):]), cache=True)
+            if p == "/api/models":
+                return self._send(200, {"ok": True, "items": model_list()})
+            if p.startswith("/models/"):
+                return self._file(safe_join(MODELS, p[len("/models/"):]), cache=True)
+            # animations from other rigs (mixamo, quaternius...), put on her in the page
+            if p == "/api/blender/status":
+                job = _blender_jobs.get(q.get("id", ""))
+                if not job:
+                    return self._send(404, {"ok": False, "error": "no such job"})
+                return self._send(200, {"ok": True, **job})
+            if p == "/api/anims":
+                return self._send(200, {"ok": True, "items": model_list(ANIMS)})
+            if p.startswith("/anims/"):
+                return self._file(safe_join(ANIMS, p[len("/anims/"):]), cache=True)
             m = re.match(r"^/data/([^/]+)/(.+)$", p)
             if m:
                 return self._file(safe_join(os.path.join(CACHE, m.group(1)), m.group(2)))
@@ -1027,16 +1175,34 @@ class Handler(BaseHTTPRequestHandler):
                 video_frame(parse_qs(urlparse(self.path).query)["id"][0], raw)
                 return self._send(200, {"ok": True})
             if self.path.startswith("/api/spring/step"):
-                sid = parse_qs(urlparse(self.path).query)["id"][0]
+                qs = parse_qs(urlparse(self.path).query)
+                sid = qs["id"][0]
                 if sid not in _springs:
                     return self._send(410, {"error": "simulation gone"})
-                return self._send(200, spring_step(sid, raw), "application/octet-stream")
+                skirt = qs.get("skirt", ["1"])[0] != "0"
+                return self._send(200, spring_step(sid, raw, skirt), "application/octet-stream")
             if self.path.startswith("/api/export"):
                 name = parse_qs(urlparse(self.path).query).get("name", ["model"])[0]
                 return self._send(200, {"ok": True, "path": export_save(name, raw)})
             if self.path.startswith("/api/images/upload"):
                 name = parse_qs(urlparse(self.path).query).get("name", ["image"])[0]
                 return self._send(200, {"ok": True, "file": image_save(name, raw)})
+            if self.path.startswith("/api/blender/put"):
+                qs = parse_qs(urlparse(self.path).query)
+                blender_put(qs.get("dir", [""])[0], qs.get("path", [""])[0], raw)
+                return self._send(200, {"ok": True})
+            if self.path.startswith("/api/anims/upload"):
+                name = parse_qs(urlparse(self.path).query).get("name", ["animation"])[0]
+                try:
+                    return self._send(200, {"ok": True, "file": model_save(name, raw, ANIMS)})
+                except ValueError as e:
+                    return self._send(400, {"ok": False, "error": str(e)})
+            if self.path.startswith("/api/models/upload"):
+                name = parse_qs(urlparse(self.path).query).get("name", ["model"])[0]
+                try:
+                    return self._send(200, {"ok": True, "file": model_save(name, raw)})
+                except ValueError as e:
+                    return self._send(400, {"ok": False, "error": str(e)})
             body = json.loads(raw or b"{}")
             if self.path == "/api/video/start":
                 vid = video_start(int(body["w"]), int(body["h"]), int(body["fps"]), body["format"], body.get("name", "video"))
@@ -1097,8 +1263,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "game": game, "data": data})
             if self.path == "/api/game/browse":
                 return self._send(200, {"ok": True, "path": browse_folder()})
+            if self.path == "/api/blender/render":
+                try:
+                    return self._send(200, {"ok": True, "id": blender_render(str(body.get("dir", "")), body.get("still", False))})
+                except ValueError as e:
+                    return self._send(400, {"ok": False, "error": str(e)})
             if self.path == "/api/open":
-                target = {"renders": RENDERS, "images": IMAGES}.get(body.get("what"), ROOT)
+                target = {"renders": RENDERS, "images": IMAGES, "models": MODELS, "anims": ANIMS}.get(body.get("what"), ROOT)
                 os.makedirs(target, exist_ok=True)
                 subprocess.Popen(["explorer", target])
                 return self._send(200, {"ok": True})
