@@ -325,14 +325,14 @@ async function loadModel(pack, manifest, sets, chara, dress, stale = () => false
   const idle = !manifest.mini && (manifest.motions.find(m => /idle01_loop$/i.test(m.name)) || manifest.motions[0]);
   if (manifest.mini) {
     const path = manifest.mini.idle || '3d/motion/mini/event/body/type00/anm_min_eve_type00_idle01_loop';
-    await playClip(await libraryClip(path), path, true, 'Idle').catch(() => {});
+    await playClip(await libraryClip(path), path, true, 'Idle', false).catch(() => {});
   } else if (idle) {
     const st = sets.find(x => x.parts.some(([, k]) => k === idle.name));
-    await playClip(await ownClip(idle.name), idle.name, true, st ? st.title : 'idle');
+    await playClip(await ownClip(idle.name), idle.name, true, st ? st.title : 'idle', false);
   } else {
     // background Umas have no motions of their own: a plain standing loop from the library
     const stand = '3d/motion/event/body/type00/anm_eve_type00_homestand01_loop';
-    await playClip(await libraryClip(stand), stand, true, 'Standing').catch(() => {});
+    await playClip(await libraryClip(stand), stand, true, 'Standing', false).catch(() => {});
   }
 }
 
@@ -707,7 +707,8 @@ function restPose() {
   current.springs?.reset();
 }
 
-async function playClip(clip, key, autoplay, title) {
+/** `keyIt`: false for the pose she starts in when she loads, which never replaces a motion key. */
+async function playClip(clip, key, autoplay, title, keyIt = true) {
   restPose();
   const a = current.mixer.clipAction(clip);
   a.reset();
@@ -724,7 +725,7 @@ async function playClip(clip, key, autoplay, title) {
   runMotion(0);
   props.applyGrips();
   // with motion keys on the timeline a picked pose goes in as a key where the timeline is
-  if (anim.active() && anim.motionKeys(current.key).length) {
+  if (keyIt && anim.active() && anim.motionKeys(current.key).length) {
     anim.keyMotion(current.key, key, poseTitle);
     setPlaying(false);
     toast(`${current.name}: ${poseTitle} from ${anim.now().toFixed(2)} s`);
@@ -747,9 +748,68 @@ function updateTime() {
   if (document.activeElement !== $('#scrub')) $('#scrub').value = t;
 }
 
-/** Her motion at scene time t: her motion keys (each pose loops from its key, the switch blends
- *  over BLEND seconds), or without keys the pose she has, looping. */
-const BLEND = 0.25;
+// switching poses blends for longer the further her body has to move: a hand gesture takes
+// BLEND, lying down to standing BLEND_MAX. a switch on a cut doesn't blend at all
+const BLEND = 0.25, BLEND_MAX = 1.0, BLEND_PER_M = 0.7, CUT_NEAR = 0.1;
+const POSE_POINTS = ['Hip', 'Head', 'Wrist_L', 'Wrist_R', 'Ankle_L', 'Ankle_R'];
+// one-shot clips (a fall, a jump) hold their last frame instead of starting over; library clips
+// are one-shots unless named _Loop
+const playsOnce = key => key.once ?? (/^anim:/.test(key.clip) && !/_Loop$/.test(key.clip));
+const clipTime = (clip, time, once) => {
+  const d = clip.duration || 1;
+  return once ? Math.min(time, d - 1e-3) : time % d;
+};
+
+/** Seconds into `clip` at scene time t for her key `key`. A run or walk played in place while
+ *  her spot is keyed across the ground plays as fast as she travels, so her feet don't slide:
+ *  half to twice its own speed, and its own speed while she stands still. */
+const STRIDE_STEP = 1 / 30;
+function clipClock(clip, key, t) {
+  const lt = Math.max(0, t - key.t);
+  const v = clip.groundSpeed;
+  let prev = v && anim.spotAt(current.key, key.t);
+  if (!prev) return lt;
+  let time = 0;
+  for (let x = key.t; x < t - 1e-9;) {
+    const dt = Math.min(STRIDE_STEP, t - x), p = anim.spotAt(current.key, x + dt);
+    const speed = Math.hypot(p[0] - prev[0], p[1] - prev[1]) / dt;
+    time += dt * (speed < 0.05 ? 1 : Math.min(2, Math.max(0.5, speed / v)));
+    x += dt;
+    prev = p;
+  }
+  return time;
+}
+
+/** Where her hips, head, hands and feet are (her root's space) in `clip` at `time`. Leaves the
+ *  mixer posed that way: the caller poses her again. */
+function posePoints(clip, time) {
+  const x = current.mixer.clipAction(clip);
+  for (const o of current.mixer._actions) if (o !== x && !current.grips?.includes(o)) o.enabled = false;
+  x.enabled = true;
+  x.play();
+  x.setEffectiveWeight(1);
+  x.time = time;
+  runMotion(0);
+  current.root.updateMatrixWorld(true);
+  const inv = current.root.matrixWorld.clone().invert();
+  return POSE_POINTS.map(n => current.root.getObjectByName(n)?.getWorldPosition(new THREE.Vector3()).applyMatrix4(inv));
+}
+
+/** How long the switch from key `prev` to key `k` blends. */
+function blendLength(prev, a, k, b) {
+  const id = `${prev.clip}@${(k.t - prev.t).toFixed(3)}>${k.clip}`;
+  current.blends ??= new Map();
+  if (!current.blends.has(id)) {
+    const p = posePoints(a, clipTime(a, clipClock(a, prev, k.t), playsOnce(prev))), q = posePoints(b, 0);
+    let far = 0;
+    p.forEach((v, i) => { if (v && q[i]) far = Math.max(far, v.distanceTo(q[i])); });
+    current.blends.set(id, Math.min(BLEND_MAX, BLEND + far * BLEND_PER_M));
+  }
+  return current.blends.get(id);
+}
+
+/** Her motion at scene time t: her motion keys (each pose plays from its key, the switch
+ *  blends), or without keys the pose she has, looping. */
 function motionAt(t) {
   if (!current) return;
   const keys = anim.motionKeys(current.key);
@@ -777,25 +837,22 @@ function motionAt(t) {
   if (prev && !a) needClip(current, prev.clip);
   if (!b) { runMotion(0); return; }
   const lt = Math.max(0, t - k.t);
-  const w = a ? Math.min(1, lt / BLEND) : 1;
+  let w = 1;
+  if (a && lt < BLEND_MAX && !anim.cutTimes(current.key).some(c => Math.abs(c - k.t) <= CUT_NEAR)) {
+    const u = Math.min(1, lt / blendLength(prev, a, k, b));
+    w = u * u * (3 - 2 * u);
+  }
   const ab = current.mixer.clipAction(b), aa = w < 1 ? current.mixer.clipAction(a) : null;
   for (const x of current.mixer._actions) if (x !== ab && x !== aa && !current.grips?.includes(x)) x.enabled = false;
-  // one-shot clips (a fall, a jump) hold their last frame instead of starting over; library
-  // clips are one-shots unless named _Loop
-  const once = key => key.once ?? (/^anim:/.test(key.clip) && !/_Loop$/.test(key.clip));
   const put = (x, time, weight, one) => {
     x.enabled = true;
     x.setLoop(THREE.LoopRepeat, Infinity);
     x.play();
     x.setEffectiveWeight(weight);
-    const d = x.getClip().duration || 1;
-    x.time = one ? Math.min(time, d - 1e-3) : time % d;
+    x.time = clipTime(x.getClip(), time, one);
   };
-  put(ab, lt, w, once(k));
-  if (aa) put(aa, t - prev.t, 1 - w, once(prev));
-  // sitting: the game's skirt rule swings the panels clear of raised knees into a flat shelf,
-  // so the skirt just rests on the thighs instead
-  if (current.springs) current.springs.skirt = !/sit|driving/i.test(k.clip);
+  put(ab, clipClock(b, k, t), w, playsOnce(k));
+  if (aa) put(aa, clipClock(a, prev, t), 1 - w, playsOnce(prev));
   current.action = ab;
   runMotion(0);
 }
@@ -1879,7 +1936,7 @@ async function recordVideo() {
       if (recording.cancel) throw new Error('cancelled');
       if (springs) {
         const target = Math.round(i * step / TICK);
-        while (ticks < target) { ticks++; poseAt(ticks * TICK); await stepAll(); }
+        while (ticks < target) { ticks++; if (scene) resetOnCut(start + (ticks - 1) * TICK, start + ticks * TICK); poseAt(ticks * TICK); await stepAll(); }
       } else poseAt(i * step);
       forCast(m => m.root.updateMatrixWorld(true));
       const cut = rootJumped();
@@ -2262,7 +2319,7 @@ async function exportBlender() {
       if (recording.cancel) throw new Error('cancelled');
       if (springs) {
         const target = Math.round(i * step / TICK);
-        while (ticks < target) { ticks++; poseAt(ticks * TICK); await stepAll(); }
+        while (ticks < target) { ticks++; if (scene3) resetOnCut(start + (ticks - 1) * TICK, start + ticks * TICK); poseAt(ticks * TICK); await stepAll(); }
       } else poseAt(i * step);
       forCast(m => m.root.updateMatrixWorld(true));
       const cut = rootJumped();
@@ -2489,11 +2546,40 @@ function animChanged() {
 }
 animChanged();
 
+/** A cut between two ticks starts the springs over on the new pose (the game's warm-up), so
+ *  nothing swings on from the shot before. */
+function resetOnCut(t0, t1) {
+  if (anim.cutTimes().some(c => c > t0 + 1e-6 && c <= t1 + 1e-6)) for (const m of cast) m.springs?.reset();
+}
+
+/** Scripted stills: the scene at time t with physics run like a video renders it, starting
+ *  `pre` seconds earlier. */
+async function settle(t, pre = 1.5) {
+  await loadMotionClips();
+  const t0 = Math.max(0, t - pre);
+  const poseAt = x => {
+    anim.apply(x, true);
+    props.animateModels(x);
+    forCast(() => { motionAt(x); faceAt(x); applyProcess(); applyFace(); });
+  };
+  const stepAll = () => Promise.all(cast.map(m => m.springs?.enabled ? m.springs.step() : null));
+  for (const m of cast) m.springs?.reset();
+  poseAt(t0);
+  await stepAll();
+  for (let k = 1; t0 + k * TICK <= t + 1e-6; k++) {
+    resetOnCut(t0 + (k - 1) * TICK, t0 + k * TICK);
+    poseAt(t0 + k * TICK);
+    await stepAll();
+  }
+  forCast(m => m.root.updateMatrixWorld(true));
+  props.updateProps();
+}
+
 window.studio = { scene, camera, controls, setCamera, setFace, savePNG, recordVideo, exportModel, chooseUma, get charas() { return charas; },
                   get current() { return current; }, video, shot, props: props.propsDebug, pose: pose.poseDebug, bgPic, anim: anim.animDebug,
                   exportBlender, renderBlender, get cast() { return cast; },
                   // for scripted shots: pause the live loop and pose / render frames by hand
-                  script: { renderFrame, libraryClip, ownClip, importedClip, playClip, applyFace, applyProcess, faceState, updateProps: props.updateProps, TICK,
+                  script: { renderFrame, settle, libraryClip, ownClip, importedClip, playClip, applyFace, applyProcess, faceState, updateProps: props.updateProps, TICK,
                             freeze(on) { recording = on ? { cancel: false } : null; } } };
 background();
 resize();

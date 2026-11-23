@@ -306,6 +306,32 @@ export const length = () => data.length;
 export const now = () => time;
 export const hasCamera = () => !!data.tracks.camera?.length;
 
+/** Where an uma's spot is keyed at time t, [x, z] in its parent's space, or null without keys. */
+export function spotAt(key, t) {
+  const keys = data.tracks[key === 'main' ? 'her' : 'uma:' + key];
+  if (!keys?.length) return null;
+  const [a, b, w] = around(keys, t);
+  if (!a.p || !b.p) return null;
+  return [a.p[0] + (b.p[0] - a.p[0]) * w, a.p[2] + (b.p[2] - a.p[2]) * w];
+}
+
+/** Cuts: the moments a step key jumps the camera or an uma's spot somewhere else, or an uma
+ *  appears or vanishes. `key` limits it to the camera and that uma's spot. */
+export function cutTimes(key = null) {
+  const out = [];
+  const spot = key === null ? null : key === 'main' ? 'her' : 'uma:' + key;
+  for (const [id, keys] of Object.entries(data.tracks)) {
+    if (id !== 'camera' && (spot ? id !== spot : id !== 'her' && !id.startsWith('uma:'))) continue;
+    for (let i = 1; i < keys.length; i++) {
+      const a = keys[i - 1], b = keys[i];
+      // showing switches at the key whatever its ease
+      const jumped = b.e === 'step' && a.p && b.p && Math.hypot(b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2]) > 0.05;
+      if (jumped || (id !== 'camera' && a.v !== b.v)) out.push(b.t);
+    }
+  }
+  return out;
+}
+
 /** The scene clock moved by dt (playing), looping over the length. */
 export function advance(dt) {
   time = (time + dt) % data.length;

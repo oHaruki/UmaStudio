@@ -51,6 +51,13 @@ MIN_BONE_DISTANCE = 1e-4
 # springs that also collide with the body fitted to her outfit (bodyfit.js): hair, and ties,
 # ribbons and collars on the chest and neck. not the bust (inside her), ears, tail or the hips' cloth
 BODY_SPRINGS = re.compile(r"^Sp_(He_Hair|Ch_(?!Bust)|Ne_)")
+# skirt panels rest on the fitted legs. the game gives them few or no leg colliders and relies on
+# its skirt rule alone, so raised knees went straight through
+SKIRT_SPRINGS = re.compile(r"^Sp_Hi_\w*Skirt")
+LEG_SHAPES = re.compile(r"^(Thigh|Knee)_[LR]$")
+# the skirt rule swings panels clear of the knees up to the outfit's max angle (80-90 degrees
+# = a flat shelf). capped, the leg colliders do the rest and the panels lie on the thighs
+SKIRT_MAX_ANGLE = 45.0
 TICK = 1 / 60
 PARTS = ("head", "body", "tail")
 
@@ -362,9 +369,13 @@ class Simulation:
             ls = self.world[node].s
             a, b = mul3(tuple(c["a"]), ls), mul3(tuple(c["b"]), ls)
             kind = CAPSULE if length(sub(a, b)) > 1e-4 else SPHERE
-            out.append({"name": f"UmaStudio_Body{k}", "node": node, "type": kind, "radius": float(c["r"]) + extra,
-                        "inner": 0, "pos": a, "pos2": b if kind == CAPSULE else (0.0, 0.0, 0.0),
-                        "normal": (0.0, 0.0, 0.0), "distance": 0.0})
+            shape = {"name": f"UmaStudio_Body{k}", "node": node, "type": kind, "radius": float(c["r"]) + extra,
+                     "inner": 0, "pos": a, "pos2": b if kind == CAPSULE else (0.0, 0.0, 0.0),
+                     "normal": (0.0, 0.0, 0.0), "distance": 0.0, "skirt": False}
+            out.append(shape)
+            # the leg at its outer surface, for skirts only
+            if c.get("outer") and LEG_SHAPES.match(c["bone"]):
+                out.append({**shape, "name": f"UmaStudio_Leg{k}", "radius": float(c["outer"]) + extra, "skirt": True})
         return out
 
     def body_gap(self, c, p):
@@ -381,10 +392,16 @@ class Simulation:
     def body_for(self, root, b, free):
         """The body colliders spring bone b checks: the nearest ones that fit in its free slots,
         leaving out any its chain starts well inside (it would be shoved out every tick)."""
-        if not self.body or free <= 0 or not BODY_SPRINGS.match(b.name):
+        if not self.body or free <= 0:
+            return []
+        if SKIRT_SPRINGS.match(b.name):
+            pool = [c for c in self.body if c["skirt"]]
+        elif BODY_SPRINGS.match(b.name):
+            pool = [c for c in self.body if not c["skirt"]]
+        else:
             return []
         start, here = self.world[root.bones[0].node].p, self.world[b.node].p
-        ok = [c for c in self.body if self.body_gap(c, start) > -0.02]
+        ok = [c for c in pool if self.body_gap(c, start) > -0.02]
         ok.sort(key=lambda c: self.body_gap(c, here))
         return [c["name"] for c in ok[:free]]
 
@@ -433,8 +450,9 @@ class Simulation:
         if not any(getattr(r, "skirt", None) for r in roots.values()):
             return
         self.skirt_arg = ctypes.create_string_buffer(SKIRT_ARG)
-        struct.pack_into("<4f", self.skirt_arg, SA_PARAMS, knee_r, ankle_r,
-                         float(data.get("_influenceAngle", 0.0)), float(data.get("_influenceMaxAngle", 0.0)))
+        near, far = float(data.get("_influenceAngle", 0.0)), float(data.get("_influenceMaxAngle", 0.0))
+        struct.pack_into("<4f", self.skirt_arg, SA_PARAMS, knee_r, ankle_r, min(near, SKIRT_MAX_ANGLE),
+                         min(far, SKIRT_MAX_ANGLE))
         self.skirt_legs = [work(n) if n is not None else None for n in legs]
         self.skirt_center = work(center)
 
@@ -615,7 +633,7 @@ class Simulation:
             return 1.0 - (far - distance) / (far - main.get("HipMoveInfluenceDistance", 0.0))
         return 0.0
 
-    def tick(self, parents, root_pos, local_rot, hip, dt=TICK, reset=False, skirt=True):
+    def tick(self, parents, root_pos, local_rot, hip, dt=TICK, reset=False):
         """One BeginSimulation/EndSimulation. parents: (pos, rot) per work node; root_pos:
         each root's local position; local_rot: every bone's local rotation now (the
         animation, or what the last tick left). Returns the bones' final rotations (model
@@ -652,7 +670,7 @@ class Simulation:
             rest = (1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, True, 1.0, True, main_rate, add_rate, 1.0)
             for root in part.roots:
                 sk = root.skirt
-                if sk is None or self.skirt_arg is None or not skirt:
+                if sk is None or self.skirt_arg is None:
                     self.dll.NativeClothUpdate(root.buf, root.count, cols, self.work_buf, *rest)
                     continue
                 # the panel as the animation has it: root where the solver has it, target
@@ -676,13 +694,13 @@ class Simulation:
                         out.append(get4(root.buf, b.index * WORK + FINAL_ROT))
         return out
 
-    def run(self, parents, root_pos, local_rot, hip, ticks=1, dt=TICK, reset=False, skirt=True):
+    def run(self, parents, root_pos, local_rot, hip, ticks=1, dt=TICK, reset=False):
         """`ticks` simulation steps on one pose (more than one = the game's warm-up, where the
         animation does not move and each step starts from what the last one left)."""
         local_rot = list(local_rot)
         out = None
         for t in range(max(1, ticks)):
-            out = self.tick(parents, root_pos, local_rot, hip, dt, reset and t == 0, skirt)
+            out = self.tick(parents, root_pos, local_rot, hip, dt, reset and t == 0)
             if t + 1 < ticks:
                 self.relocal(parents, out, local_rot)
         return out
@@ -698,11 +716,10 @@ class Simulation:
                 local_rot[k] = qmul(qinv(pq), finals[k])
             world[b.node] = qmul(pq, local_rot[k])
 
-    def step(self, raw, skirt=True):
+    def step(self, raw):
         """run() from the viewer's packed floats: dt, ticks, reset, hip xyz, then each
         parent's position + rotation, each root's local position, each bone's local
-        rotation. Answers per bone: applied (0/1) and the final rotation. skirt=False skips the
-        skirt rule (sitting: raised knees would swing the panels out flat)."""
+        rotation. Answers per bone: applied (0/1) and the final rotation."""
         a = array.array("f")
         a.frombytes(raw)
         nw, nr, nb = len(self.work_nodes), len(self.roots), len(self.bones)
@@ -714,7 +731,7 @@ class Simulation:
         root_pos = [tuple(a[o + 3 * k:o + 3 * k + 3]) for k in range(nr)]
         o += nr * 3
         local_rot = [tuple(a[o + 4 * k:o + 4 * k + 4]) for k in range(nb)]
-        out = self.run(parents, root_pos, local_rot, tuple(a[3:6]), ticks=int(a[1]), dt=a[0], reset=a[2] > 0.5, skirt=skirt)
+        out = self.run(parents, root_pos, local_rot, tuple(a[3:6]), ticks=int(a[1]), dt=a[0], reset=a[2] > 0.5)
         res = array.array("f", [0.0] * (nb * 5))
         for k, q in enumerate(out):
             if q is not None:

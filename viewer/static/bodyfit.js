@@ -9,7 +9,12 @@ import * as THREE from 'three';
 
 const TORSO = [['Waist', 'Spine'], ['Spine', 'Chest'], ['Chest', 'Neck']];
 const LIMBS = [['Neck', 'Head', 0.5], ...['L', 'R'].flatMap(s => [
-  [`Shoulder_${s}`, `Arm_${s}`, 0.5], [`Arm_${s}`, `Elbow_${s}`, 0.4], [`Elbow_${s}`, `Wrist_${s}`, 0.4], [`Thigh_${s}`, `Knee_${s}`, 0.4]])];
+  [`Shoulder_${s}`, `Arm_${s}`, 0.5], [`Arm_${s}`, `Elbow_${s}`, 0.4], [`Elbow_${s}`, `Wrist_${s}`, 0.4], [`Thigh_${s}`, `Knee_${s}`, 0.4],
+  [`Knee_${s}`, `Ankle_${s}`, 0.4]])];
+// the limbs' outer surface (sleeves, cuffs, boots) as well: skirts rest on the legs' (their few
+// joints stand for a whole panel, so a thinner leg lets the cloth between them cut through) and
+// retargeted arms keep out of each other and the legs with it
+const OUTER = 0.85;
 const MIN_WEIGHT = 0.6;   // a vertex counts for the bone that moves it at least this much
 
 const quantile = (arr, k) => {
@@ -115,7 +120,9 @@ export function fitBody(root) {
     const r = quantile(R, k);
     const s0 = Math.max(quantile(S, 0.05), r * 0.5), s1 = Math.min(quantile(S, 0.95), len - r * 0.5);
     if (s1 <= s0) continue;
-    out.push({ bone, a: a.clone().multiplyScalar(s0), b: a.clone().multiplyScalar(s1), r });
+    const shape = { bone, a: a.clone().multiplyScalar(s0), b: a.clone().multiplyScalar(s1), r };
+    if (/^(Thigh|Knee|Arm|Elbow)_/.test(bone)) shape.outer = quantile(R, OUTER);
+    out.push(shape);
   }
   return out;
 }

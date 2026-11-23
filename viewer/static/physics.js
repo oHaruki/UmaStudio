@@ -30,7 +30,7 @@ export class GameSprings {
       return [o.name, index.has(o.parent) ? index.get(o.parent) : -1, t, r, [s.x, s.y, s.z]];
     });
     const u = v => { const a = []; uPos(v, a, 0); return a; };
-    const fit = body && { clearance: body.clearance, shapes: body.shapes.map(c => ({ bone: c.bone, a: u(c.a), b: u(c.b), r: c.r })) };
+    const fit = body && { clearance: body.clearance, shapes: body.shapes.map(c => ({ bone: c.bone, a: u(c.a), b: u(c.b), r: c.r, outer: c.outer })) };
     const info = await post('/api/spring/new', { pack, nodes, body: fit }, null);
     return info.bones.length ? new GameSprings(root, rest, info) : null;
   }
@@ -86,7 +86,7 @@ export class GameSprings {
     let res;
     for (let tries = 1; ; tries++) {
       try {
-        res = await fetch(`/api/spring/step?id=${this.id}${this.skirt === false ? '&skirt=0' : ''}`,
+        res = await fetch(`/api/spring/step?id=${this.id}`,
                           { method: 'POST', headers: { 'X-Studio': '1' }, body: a.buffer });
         break;
       } catch (e) {

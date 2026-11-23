@@ -1,11 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { fitBody } from '/static/bodyfit.js';
 
 // animations from other humanoid rigs (mixamo, quaternius / unreal, vrm-style names) put on an
 // uma's skeleton. per bone, the source's turn away from its rest pose is copied in the
 // character's own space; where the two rest poses point a bone differently (an A-pose source on
 // her T-pose), that difference is taken out first so arms don't end up raised or lowered. the
-// hips also carry the bounce and sway, scaled to her height.
+// hips also carry the bounce and sway, scaled to her height. her arms are then kept out of her
+// body: the source's proportions differ, so hands and forearms can land inside her torso, her
+// thighs or the other arm.
 
 // source bone name (lowercased, separators and rig prefixes stripped) -> uma bone
 const MAP = {};
@@ -138,6 +141,10 @@ export function retarget(src, clip, cur, { fps = 30, inPlace = true } = {}) {
   const quats = pairs.map(() => new Float32Array(n * 4));
   const hipPos = new Float32Array(n * 3);
   const target = new THREE.Quaternion(), parent = new THREE.Quaternion();
+  const guard = armGuard(cur);
+  const feet = ['L', 'R'].map(S => [dRoot.getObjectByName(`Ankle_${S}`), dRoot.getObjectByName(`Toe_${S}`)]).filter(f => f[0]);
+  const feetAt = feet.map(() => new Float32Array(n * 3));   // ankle x, z from the hips, the foot's lowest point
+  const hipW = new THREE.Vector3(), footW = new THREE.Vector3(), toeW = new THREE.Vector3();
   let x0 = 0, z0 = 0;
   for (let i = 0; i < n; i++) {
     const t = Math.min(clip.duration, i / fps);
@@ -150,10 +157,18 @@ export function retarget(src, clip, cur, { fps = 30, inPlace = true } = {}) {
       if (p.d.parent && p.d.parent !== dRoot) relQuat(p.d.parent, dInv, parent); else parent.identity();
       p.d.quaternion.copy(parent.invert().multiply(target));
       p.d.updateMatrixWorld(true);
-      p.d.quaternion.toArray(quats[j], i * 4);
     });
+    guard();
+    pairs.forEach((p, j) => p.d.quaternion.toArray(quats[j], i * 4));
     // hips: the source's move since rest, scaled, in the hip's parent space
     const pos = relPos(hip.s, sMatInv, _v).sub(sHip0).multiplyScalar(k);
+    // the feet: where they are from her hips, and how high with the hips' bob
+    hip.d.getWorldPosition(hipW);
+    feet.forEach(([ankle, toe], j) => {
+      ankle.getWorldPosition(footW);
+      const low = toe ? Math.min(footW.y, toe.getWorldPosition(toeW).y) : footW.y;
+      feetAt[j].set([footW.x - hipW.x, footW.z - hipW.z, low + pos.y], i * 3);
+    });
     if (i === 0) { x0 = pos.x; z0 = pos.z; }
     if (inPlace) { pos.x -= x0; pos.z -= z0; }
     if (hip.d.parent && hip.d.parent !== dRoot) {
@@ -173,5 +188,113 @@ export function retarget(src, clip, cur, { fps = 30, inPlace = true } = {}) {
 
   const tracks = pairs.map((p, j) => new THREE.QuaternionKeyframeTrack(THREE.PropertyBinding.sanitizeNodeName(p.d.name) + '.quaternion', times, quats[j]));
   tracks.push(new THREE.VectorKeyframeTrack('Hip.position', times, hipPos));
-  return new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  const out = new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  out.groundSpeed = inPlace ? groundSpeed(feetAt, fps) : 0;
+  return out;
+}
+
+/** How fast a clip played in place would cover ground (m/s): the speed a planted foot moves
+ *  back under her, 0 when her feet don't travel (standing, sitting). */
+function groundSpeed(feetAt, fps) {
+  const speeds = [];
+  for (const a of feetAt) {
+    const n = a.length / 3;
+    let low = Infinity;
+    for (let i = 0; i < n; i++) low = Math.min(low, a[i * 3 + 2]);
+    for (let i = 1; i < n; i++) {
+      // planted: heel or toe near its lowest on both frames
+      if (a[i * 3 + 2] - low > 0.03 || a[i * 3 - 1] - low > 0.03) continue;
+      speeds.push(Math.hypot(a[i * 3] - a[i * 3 - 3], a[i * 3 + 1] - a[i * 3 - 2]) * fps);
+    }
+  }
+  if (speeds.length < 4) return 0;
+  speeds.sort((x, y) => x - y);
+  const v = speeds[speeds.length >> 1];
+  return v > 0.3 ? v : 0;
+}
+
+// --- arms out of her body ------------------------------------------------------------------------
+
+const ARM_PASSES = 4;      // per arm, each frame
+const ARM_SLACK = 0.008;   // m of overlap that is left alone (sleeves brushing the body)
+const HAND_R = 0.025;
+const _d1 = new THREE.Vector3(), _d2 = new THREE.Vector3(), _r = new THREE.Vector3();
+const _w = new THREE.Quaternion(), _turn = new THREE.Quaternion();
+
+/** The closest points of segments p1q1 and p2q2 into c1, c2; returns their distance. */
+function segSeg(p1, q1, p2, q2, c1, c2) {
+  _d1.subVectors(q1, p1); _d2.subVectors(q2, p2); _r.subVectors(p1, p2);
+  const a = _d1.dot(_d1), e = _d2.dot(_d2), f = _d2.dot(_r);
+  let s = 0, t = 0;
+  if (a <= 1e-12 && e <= 1e-12) { s = t = 0; }
+  else if (a <= 1e-12) { t = Math.max(0, Math.min(1, f / e)); }
+  else {
+    const c = _d1.dot(_r);
+    if (e <= 1e-12) s = Math.max(0, Math.min(1, -c / a));
+    else {
+      const b = _d1.dot(_d2), den = a * e - b * b;
+      s = den > 1e-12 ? Math.max(0, Math.min(1, (b * f - c * e) / den)) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = Math.max(0, Math.min(1, -c / a)); }
+      else if (t > 1) { t = 1; s = Math.max(0, Math.min(1, (b - c) / a)); }
+    }
+  }
+  c1.copy(p1).addScaledVector(_d1, s);
+  c2.copy(p2).addScaledVector(_d2, t);
+  return c1.distanceTo(c2);
+}
+
+/** A per-frame step that turns each upper arm about its shoulder until her forearm and hand are
+ *  outside her fitted body (bodyfit.js shapes) and the other arm. */
+function armGuard(cur) {
+  const root = cur.root;
+  const shapes = (cur.bodyFit ??= fitBody(root)).map(c => ({ ...c, o: root.getObjectByName(c.bone) })).filter(c => c.o);
+  const sides = ['L', 'R'].map(S => {
+    const O = S === 'L' ? 'R' : 'L';
+    const arm = root.getObjectByName(`Arm_${S}`), elbow = root.getObjectByName(`Elbow_${S}`), wrist = root.getObjectByName(`Wrist_${S}`);
+    if (!arm || !elbow || !wrist) return null;
+    const tip = root.getObjectByName(`Middle_02_${S}`) || root.getObjectByName(`Middle_01_${S}`);
+    const f = shapes.find(c => c.bone === `Elbow_${S}`), fore = f ? f.outer ?? f.r : 0.03;
+    // her torso, neck and legs, and the other arm. not her own arm or either shoulder
+    const blocks = shapes.filter(c => /^(Waist|Spine|Chest|Neck|Thigh_[LR]|Knee_[LR])$/.test(c.bone) || c.bone === `Arm_${O}` || c.bone === `Elbow_${O}`);
+    return { arm, elbow, wrist, tip, fore, blocks };
+  }).filter(Boolean);
+  if (!sides.length || !shapes.length) return () => {};
+  const E = new THREE.Vector3(), W = new THREE.Vector3(), T = new THREE.Vector3(), A = new THREE.Vector3(), B = new THREE.Vector3();
+  const mine = new THREE.Vector3(), theirs = new THREE.Vector3(), best = new THREE.Vector3(), out = new THREE.Vector3();
+  const pivot = new THREE.Vector3(), from = new THREE.Vector3(), to = new THREE.Vector3(), sc = new THREE.Vector3();
+  return () => {
+    for (let pass = 0; pass < ARM_PASSES; pass++) {
+      let moved = false;
+      for (const s of sides) {
+        s.elbow.getWorldPosition(E);
+        s.wrist.getWorldPosition(W);
+        if (s.tip) s.tip.getWorldPosition(T); else T.subVectors(W, E).setLength(0.07).add(W);
+        let deepest = ARM_SLACK, found = false;
+        for (const c of s.blocks) {
+          const k = c.o.getWorldScale(sc).x;
+          c.o.localToWorld(A.copy(c.a));
+          c.o.localToWorld(B.copy(c.b));
+          for (const [p, q, r] of [[E, W, s.fore], [W, T, HAND_R]]) {
+            const d = segSeg(p, q, A, B, mine, theirs);
+            const depth = (c.outer ?? c.r) * k + r - d;
+            if (depth > deepest && d > 1e-6) { deepest = depth; found = true; best.copy(mine); out.subVectors(mine, theirs).normalize(); }
+          }
+        }
+        if (!found) continue;
+        // the smallest turn about the shoulder that takes that point out
+        s.arm.getWorldPosition(pivot);
+        from.subVectors(best, pivot);
+        to.copy(best).addScaledVector(out, deepest).sub(pivot);
+        if (from.lengthSq() < 1e-8) continue;
+        _turn.setFromUnitVectors(from.normalize(), to.normalize());
+        s.arm.getWorldQuaternion(_w).premultiply(_turn);
+        s.arm.parent.getWorldQuaternion(_q).invert();
+        s.arm.quaternion.copy(_q.multiply(_w));
+        s.arm.updateMatrixWorld(true);
+        moved = true;
+      }
+      if (!moved) break;
+    }
+  };
 }

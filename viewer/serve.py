@@ -173,10 +173,10 @@ def spring_new(pack, nodes, body=None):
     return {"id": sid, **sim.describe()}
 
 
-def spring_step(sid, raw, skirt=True):
+def spring_step(sid, raw):
     sim, lock = _springs[sid]
     with lock:
-        return sim.step(raw, skirt)
+        return sim.step(raw)
 
 
 # --- story scenes ---------------------------------------------------------------------------
@@ -1179,8 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = qs["id"][0]
                 if sid not in _springs:
                     return self._send(410, {"error": "simulation gone"})
-                skirt = qs.get("skirt", ["1"])[0] != "0"
-                return self._send(200, spring_step(sid, raw, skirt), "application/octet-stream")
+                return self._send(200, spring_step(sid, raw), "application/octet-stream")
             if self.path.startswith("/api/export"):
                 name = parse_qs(urlparse(self.path).query).get("name", ["model"])[0]
                 return self._send(200, {"ok": True, "path": export_save(name, raw)})
