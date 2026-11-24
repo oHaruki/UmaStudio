@@ -12,3 +12,6 @@ viewer/UmaStudio.spec
 
 *.bak
 *.log
+
+# scene tools
+viewer/tools/node_modules/

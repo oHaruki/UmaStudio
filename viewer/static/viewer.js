@@ -14,6 +14,7 @@ import * as pose from '/static/pose.js';
 import * as anim from '/static/anim.js';
 import { loadSource, retarget } from '/static/retarget.js';
 import { makeChain, settings as finish } from '/static/post.js';
+import { initScenes, tick as sceneTick, scenesDebug } from '/static/scenekit.js';
 
 // --- renderer -----------------------------------------------------------------
 
@@ -75,6 +76,9 @@ let recording = null;        // { cancel } while a video is being made
 
 // --- choosing an Uma --------------------------------------------------------------------
 
+let castReady;
+const castLoaded = new Promise(r => { castReady = r; });
+
 async function start() {
   const s = await getJson('/api/status', null);
   $('#status').textContent = s.version ? 'v' + s.version : '';
@@ -113,6 +117,7 @@ async function start() {
     }
     if (cast.length > 1) setActive(cast[0]);
   } else openPicker();
+  castReady();
 }
 
 // game files not found: the user points at the install or data folder by hand
@@ -1673,6 +1678,14 @@ function setBg(b) {
   radio('#bgs .chip', b);
   background();
 }
+/** A background by its value: 'stage', 'picture', a colour chip's value or any '#rrggbb'. */
+function setBgValue(v) {
+  const chip = $(`#bgs .chip[data-bg="${v}"]`);
+  if (chip) return setBg(chip);
+  shot.bg = v;
+  store.set('bg', v);
+  background();
+}
 $$('#bgs .chip').forEach(b => {
   b.onclick = async () => {
     if (b.dataset.bg === 'picture' && !bgPic.tex && !(await chooseBgPicture())) return;
@@ -2174,14 +2187,14 @@ async function texturePng(t) {
   return await new Promise(r => c.toBlob(r, 'image/png'));
 }
 
-async function exportBlender() {
+async function exportBlender(name = null) {
   if (!current) return openPicker();
   const scene3 = anim.active();
   if (!scene3 && !current.action) return toast('Pick a pose first', true);
   const fps = Math.min(60, video.fps);
   const seconds = scene3 ? anim.length() : current.action.getClip().duration;
   const frames = Math.max(1, Math.round(seconds * fps));
-  const dir = fileName().replace(/[^\w\-. ]/g, '_').slice(0, 100);
+  const dir = (name || fileName()).replace(/[^\w\-. ]/g, '_').slice(0, 100);
   const [W, H] = targetSize();
   const wasPlaying = playing;
   setPlaying(false);
@@ -2389,6 +2402,9 @@ async function exportBlender() {
       focusOn: active.key, cast: focus, place: placeRoot ? liveStage.id : null,
       textures: textures.size,
     };
+    // a scene file's night tints and flashes, focus pulls and haze
+    const sc = anim.sceneInfo();
+    if (sc) for (const k of ['fx', 'focusKeys', 'haze']) if (sc[k] !== null && sc[k] !== undefined) meta[k] = sc[k];
     await putFile(dir, 'scene.json', new Blob([JSON.stringify(meta, null, 1)]));
     toast(`Saved for Blender: ${dir}`, false, ['Render in Blender', () => renderBlender(dir)]);
     return dir;
@@ -2420,7 +2436,7 @@ async function renderBlender(dir, still = false) {
   }
 }
 $('#exportBlender').onclick = async () => {
-  const dir = await exportBlender().catch(e => { if (e.message !== 'cancelled') toast(e.message, true); return null; });
+  const dir = await exportBlender(anim.sceneInfo()?.name || null).catch(e => { if (e.message !== 'cancelled') toast(e.message, true); return null; });
   if (dir && $('#blenderRender').checked) renderBlender(dir).catch(e => toast(e.message, true));
 };
 
@@ -2464,6 +2480,7 @@ renderer.setAnimationLoop(() => {
   const speed = current ? current.mixer.timeScale : 1;
   if (scene && playing) anim.advance(dt * speed);
   anim.apply();
+  sceneTick();
   modelClock = scene ? anim.now() : modelClock + dt;
   props.animateModels(modelClock);
   if (current) {
@@ -2478,7 +2495,8 @@ renderer.setAnimationLoop(() => {
       m.root.updateMatrixWorld(true);
       const cut = m === active ? rootJumped() : jumped(m);
       if (cut) m.springs?.reset();
-      if (m === active && !(scene && playing && anim.hasCamera())) followCamera(dt, cut);
+      // a keyed camera is the timeline's, paused too
+      if (m === active && !(scene && anim.hasCamera())) followCamera(dt, cut);
       applyHeadTurn(dt);
       applyEyeTrace(dt);
       const tk = m.springs?.frame(dt);
@@ -2536,6 +2554,20 @@ anim.initAnim({ camera, controls, get place() { return place; }, stagePicked, pa
                 selectedProp: props.selectedProp, propByKey: props.propByKey, propLabel: p => props.propLabel(p),
                 onChange: animChanged, onSeek: () => updateTime() });
 
+initScenes({ useSize: size => { if (shot.size !== size) useSize(size, !PRESETS.includes(size)); }, size: () => shot.size,
+             setFps: fps => { video.fps = fps; store.set('vidFps', fps); radio('#vidFps .chip', $(`#vidFps .chip[data-fps="${fps}"]`)); },
+             stage: () => liveStage, openStage, condOf, setBg: setBgValue,
+             members: () => cast, charas: () => charas, chooseUma, removeMember, setActive,
+             props: () => props.propsDebug, importedSets,
+             facePresets: key => {
+               const m = cast.find(x => x.key === key);
+               const f = m === current ? face : m?.g?.face;
+               return f?.presets ? f.presets.map(p => p.label) : null;
+             },
+             settle, renderFrame, freeze: on => { if (on) setPlaying(false); recording = on ? { cancel: false } : null; },
+             afterLoad: () => { setPlaying(false); anim.seek(Math.min(anim.now(), anim.length())); animChanged(); },
+             whenReady: () => castLoaded });
+
 /** Keys added or taken away: the timeline and the video length follow. */
 function animChanged() {
   const scene = anim.active();
@@ -2577,7 +2609,7 @@ async function settle(t, pre = 1.5) {
 
 window.studio = { scene, camera, controls, setCamera, setFace, savePNG, recordVideo, exportModel, chooseUma, get charas() { return charas; },
                   get current() { return current; }, video, shot, props: props.propsDebug, pose: pose.poseDebug, bgPic, anim: anim.animDebug,
-                  exportBlender, renderBlender, get cast() { return cast; },
+                  exportBlender, renderBlender, get cast() { return cast; }, scenes: scenesDebug,
                   // for scripted shots: pause the live loop and pose / render frames by hand
                   script: { renderFrame, settle, libraryClip, ownClip, importedClip, playClip, applyFace, applyProcess, faceState, updateProps: props.updateProps, TICK,
                             freeze(on) { recording = on ? { cancel: false } : null; } } };

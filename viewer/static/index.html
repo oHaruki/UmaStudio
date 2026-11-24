@@ -172,6 +172,31 @@ canvas#view { width: 100%; height: 100%; display: block; outline: none; }
 #keyMarks i.mot { width: 7px; height: 7px; margin-left: -3px; bottom: -3px; border-radius: 50%; background: #6fb3ff;
   box-shadow: 0 0 0 1px rgba(0,0,0,.5); pointer-events: auto; cursor: pointer; }
 #follow { width: 118px; flex: none; }
+/* a scene file's beats over the timeline */
+#beatBands { position: absolute; left: 2px; right: 2px; top: 1px; height: 9px; pointer-events: none; }
+#beatBands i { position: absolute; top: 0; height: 9px; background: rgba(111,179,255,.22); border-left: 1px solid rgba(111,179,255,.6);
+  font: 600 8px/9px sans-serif; font-style: normal; color: #cfe3ff; padding-left: 2px; overflow: hidden; box-sizing: border-box; }
+#beatBands i.odd { background: rgba(111,179,255,.12); }
+
+/* scene file panel */
+#sceneBeats { display: flex; flex-direction: column; border-radius: var(--r); overflow: hidden; max-height: 260px; overflow-y: auto; }
+#sceneBeats:empty { display: none; }
+.beatRow { display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 6px; cursor: pointer; }
+.beatRow:nth-child(odd) { background: var(--row); }
+.beatRow:nth-child(even) { background: var(--row-alt); }
+.beatRow:hover { background: var(--row-hi); }
+.beatRow.on { background: var(--sel-row); }
+.beatRow .n { width: 18px; color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
+.beatRow .t { width: 34px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.beatRow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.beatRow i { font-style: normal; color: #e8b04a; }
+#sceneNote { width: 100%; min-height: 64px; resize: vertical; box-sizing: border-box; font: inherit; padding: 5px 6px; }
+#sceneSay { font-style: italic; }
+#sceneWarn { display: flex; flex-direction: column; gap: 2px; max-height: 160px; overflow-y: auto; }
+#sceneWarn:empty { display: none; }
+.warnRow { font-size: 11px; line-height: 1.35; padding: 2px 6px; border-radius: var(--r); background: var(--row); cursor: default; }
+.warnRow.warn { color: #e8c37a; cursor: pointer; }
+.warnRow.error { color: #ff8f8f; }
 
 /* --- sidebar: pages with tabs on the outer edge -------------------------------------------- */
 
@@ -361,6 +386,7 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
     <div id="scrubWrap">
       <input type="range" id="scrub" min="0" max="1" step="0.001" value="0" title="Pause anywhere: that frame is your pose">
       <div id="keyMarks"></div>
+      <div id="beatBands"></div>
     </div>
     <button id="playKey" class="b" title="K: key what's picked at this moment">◆ Key</button>
     <button id="playMotion" class="b" title="From this moment she plays the pose she has now">● Motion</button>
@@ -537,6 +563,27 @@ body.dropping::after { content: 'Drop the picture'; position: fixed; inset: 8px;
               <div class="hint">Pick a part in the list or click it in the view: what a click would take is outlined, clicking the same spot again takes the next thing behind it. W / E / R switch handles, Delete hides, Esc lets go. Kept per place.</div>
             </div>
           </div>
+        </div>
+      </details>
+      <details class="panel" id="pnlScene" open>
+        <summary>Scene file</summary>
+        <div class="body">
+          <div class="line">
+            <select id="sceneList" class="field grow" title="Scenes in Pictures\UmaStudio\scenes"></select>
+            <button class="b" id="sceneLoad" title="Set up the place, the umas and the props, and put the scene on the timeline">Load</button>
+          </div>
+          <label class="check" title="Loads it again whenever scene.js is saved"><input type="checkbox" id="sceneWatch" checked> Reload when the file changes</label>
+          <div class="prop"><span>Scene</span><span class="val" id="sceneInfo">No scene loaded</span></div>
+          <div id="sceneBeats"></div>
+          <div class="hint" id="sceneSay"></div>
+          <textarea id="sceneNote" class="field" placeholder="Move into a beat to write about it" spellcheck="true" disabled></textarea>
+          <div id="sceneWarn"></div>
+          <div class="seg">
+            <button class="chip" id="sceneSheet" title="One frame of each beat in one picture, saved in the scene's folder">Make sheet</button>
+            <button class="chip" id="sceneOpen" title="The scene's folder">Open folder</button>
+          </div>
+          <div class="hint" id="sceneStatus"></div>
+          <div class="hint">A scene file is a short written as code (Pictures\UmaStudio\scenes\name\scene.js). Notes you write on a beat are saved next to it in notes.json. Loading one replaces the umas, props and timeline.</div>
         </div>
       </details>
       <details class="panel" id="pnlAnim">

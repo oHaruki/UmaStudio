@@ -1,0 +1,9 @@
+{
+  "name": "umastudio-tools",
+  "private": true,
+  "type": "module",
+  "description": "Drives the viewer headless for scene files (scene.mjs)",
+  "dependencies": {
+    "playwright-core": "1.49.1"
+  }
+}

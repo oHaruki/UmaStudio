@@ -12,6 +12,9 @@ import { $, $$, store, radio, typing } from '/static/ui.js';
 // plays that pose; viewer.js blends from one to the next. face keys ('face:<her key>', { t, face })
 // switch her expression preset. her spot is 'her' for the first uma,
 // 'uma:<key>' for the others.
+//
+// a scene file (scenekit.js) replaces the whole timeline at once and adds `data.scene`: its beats
+// (shown as bands over the timeline), and what only the Blender render uses (fx, focus, haze).
 
 const EASES = {
   smooth: u => u < 0.5 ? 4 * u * u * u : 1 - (-2 * u + 2) ** 3 / 2,
@@ -92,6 +95,7 @@ function snapshot(obj) {
 }
 
 function putKey(id, key) {
+  keysVersion++;
   const keys = (data.tracks[id] ||= []);
   const i = keys.findIndex(k => Math.abs(k.t - key.t) < SNAP);
   if (i >= 0) keys[i] = key; else keys.push(key);
@@ -101,12 +105,14 @@ function putKey(id, key) {
 
 /** Keys in [from, to] taken out (a preset lays its own there). */
 function clearRange(id, from, to) {
+  keysVersion++;
   const keys = data.tracks[id];
   if (!keys) return;
   data.tracks[id] = keys.filter(k => k.t < from - SNAP / 2 || k.t > to + SNAP / 2);
 }
 
 function changed() {
+  keysVersion++;
   for (const [id, keys] of Object.entries(data.tracks)) if (!keys.length) delete data.tracks[id];
   save();
   dirty = true;
@@ -117,8 +123,12 @@ function changed() {
 const _p = new THREE.Vector3(), _p2 = new THREE.Vector3(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
 const _s = new THREE.Vector3(), _s2 = new THREE.Vector3(), _box = new THREE.Box3(), _size = new THREE.Vector3();
 
-/** Where the keys are around t: [a, b, w] with w the eased way from a to b. */
-function around(keys, t) {
+/** Where the keys are around t: [a, b, w] with w the eased way from a to b. `ch` limits it to
+ *  the keys that have that channel (a key may leave some out), eased by the key's own `e<ch>`
+ *  when it has one. */
+function around(keys, t, ch = null) {
+  if (ch) keys = withChannel(keys, ch);
+  if (!keys.length) return [null, null, 0];
   if (t <= keys[0].t) return [keys[0], keys[0], 0];
   const last = keys[keys.length - 1];
   if (t >= last.t) return [last, last, 0];
@@ -126,29 +136,67 @@ function around(keys, t) {
   while (keys[i + 1].t <= t) i++;
   const a = keys[i], b = keys[i + 1];
   const u = (t - a.t) / (b.t - a.t);
-  return [a, b, (EASES[b.e] || EASES.smooth)(u)];
+  return [a, b, (EASES[(ch && b['e' + ch]) || b.e] || EASES.smooth)(u)];
+}
+
+// the keys holding a channel, per key list, until the keys change
+const channelCache = new WeakMap();
+let keysVersion = 0;
+function withChannel(keys, ch) {
+  let m = channelCache.get(keys);
+  if (!m || m.version !== keysVersion) channelCache.set(keys, m = { version: keysVersion });
+  return m[ch] ||= keys.filter(k => k[ch] !== undefined);
+}
+
+/** A channel's value at t (an array, a number or a bool), null when no key has it. */
+export function channelAt(keys, ch, t) {
+  const [a, b, w] = around(keys, t, ch);
+  if (!a) return null;
+  if (ch === 'v') return a === b || t < b.t ? a.v : b.v;
+  if (ch === 'q') return _q.fromArray(a.q).slerp(_q2.fromArray(b.q), w).toArray();
+  if (typeof a[ch] === 'number') return a[ch] + (b[ch] - a[ch]) * w;
+  return a[ch].map((x, i) => x + (b[ch][i] - x) * w);
 }
 
 function applyTrack(id, keys, t) {
   if (id.startsWith('motion:') || id.startsWith('face:')) return;   // viewer.js plays those
   if (id === 'camera') {
-    const [a, b, w] = around(keys, t);
     const c = ctx.camera;
-    c.position.lerpVectors(_p.fromArray(a.p), _p2.fromArray(b.p), w);
-    ctx.controls.target.lerpVectors(_p.fromArray(a.tg), _p2.fromArray(b.tg), w);
-    const fov = a.fov + (b.fov - a.fov) * w;
-    if (Math.abs(fov - c.fov) > 1e-4) { c.fov = fov; c.updateProjectionMatrix(); }
+    const p = channelAt(keys, 'p', t), tg = channelAt(keys, 'tg', t), fov = channelAt(keys, 'fov', t);
+    if (p) c.position.fromArray(p);
+    if (tg) ctx.controls.target.fromArray(tg);
+    if (fov !== null && Math.abs(fov - c.fov) > 1e-4) { c.fov = fov; c.updateProjectionMatrix(); }
     c.lookAt(ctx.controls.target);
+    shake(c, t);
     return;
   }
   const obj = resolve(id);
   if (!obj) return;
-  const [a, b, w] = around(keys, t);
-  // a key may leave out position, turn or size: those stay as they are
-  if (a.p && b.p) obj.position.lerpVectors(_p.fromArray(a.p), _p2.fromArray(b.p), w);
-  if (a.q && b.q) obj.quaternion.slerpQuaternions(_q.fromArray(a.q), _q2.fromArray(b.q), w);
-  if (a.s && b.s) obj.scale.lerpVectors(_s.fromArray(a.s), _s2.fromArray(b.s), w);
-  obj.visible = a === b || t < b.t ? a.v : b.v;
+  // a key may leave out position, turn, size or showing: those stay as they are
+  const p = channelAt(keys, 'p', t), q = channelAt(keys, 'q', t), s = channelAt(keys, 's', t), v = channelAt(keys, 'v', t);
+  if (p) obj.position.fromArray(p);
+  if (q) obj.quaternion.fromArray(q);
+  if (s) obj.scale.fromArray(s);
+  if (v !== null) obj.visible = v;
+}
+
+/** A scene file's camera shakes ({ t, d, a }): the view jolts sideways and up, dying away. */
+const _r = new THREE.Vector3(), _u = new THREE.Vector3();
+function shake(c, t) {
+  let x = 0, y = 0;
+  for (const k of data.scene?.shakes || []) {
+    const u = (t - k.t) / k.d;
+    if (u < 0 || u > 1) continue;
+    const a = k.a * (1 - u) ** 2;
+    x += a * (Math.sin(t * 61.7 + k.t * 3.1) * 0.7 + Math.sin(t * 23.3) * 0.3);
+    y += a * (Math.sin(t * 53.9 + k.t * 7.3) * 0.7 + Math.sin(t * 31.1 + 1.3) * 0.3);
+  }
+  if (!x && !y) return;
+  _r.set(x, 0, 0).applyQuaternion(c.quaternion);
+  _u.set(0, y, 0).applyQuaternion(c.quaternion);
+  c.position.add(_r).add(_u);
+  ctx.controls.target.addScaledVector(_r, 0.6).addScaledVector(_u, 0.6);
+  c.lookAt(ctx.controls.target);
 }
 
 // --- presets -------------------------------------------------------------------------------------
@@ -238,7 +286,26 @@ function preset(name) {
   changed();
 }
 
+function beatBands() {
+  const box = $('#beatBands');
+  if (!box) return;
+  box.innerHTML = '';
+  const beats = data.scene?.beats || [];
+  const L = data.length;
+  beats.forEach((b, i) => {
+    const d = document.createElement('i');
+    d.className = i % 2 ? 'odd' : '';
+    d.style.left = (100 * Math.min(1, b.t0 / L)) + '%';
+    d.style.width = (100 * Math.max(0, Math.min(L, b.t1) - b.t0) / L) + '%';
+    d.title = `${i + 1}. ${b.title} (${b.t0.toFixed(1)} to ${b.t1.toFixed(1)} s)`;
+    d.textContent = i + 1;
+    d.onclick = () => seek(b.t0 + 1e-3);
+    box.appendChild(d);
+  });
+}
+
 function marks() {
+  beatBands();
   const box = $('#keyMarks');
   box.innerHTML = '';
   if (!active()) return;
@@ -310,9 +377,8 @@ export const hasCamera = () => !!data.tracks.camera?.length;
 export function spotAt(key, t) {
   const keys = data.tracks[key === 'main' ? 'her' : 'uma:' + key];
   if (!keys?.length) return null;
-  const [a, b, w] = around(keys, t);
-  if (!a.p || !b.p) return null;
-  return [a.p[0] + (b.p[0] - a.p[0]) * w, a.p[2] + (b.p[2] - a.p[2]) * w];
+  const p = channelAt(keys, 'p', t);
+  return p ? [p[0], p[2]] : null;
 }
 
 /** Cuts: the moments a step key jumps the camera or an uma's spot somewhere else, or an uma
@@ -322,12 +388,15 @@ export function cutTimes(key = null) {
   const spot = key === null ? null : key === 'main' ? 'her' : 'uma:' + key;
   for (const [id, keys] of Object.entries(data.tracks)) {
     if (id !== 'camera' && (spot ? id !== spot : id !== 'her' && !id.startsWith('uma:'))) continue;
-    for (let i = 1; i < keys.length; i++) {
-      const a = keys[i - 1], b = keys[i];
-      // showing switches at the key whatever its ease
-      const jumped = b.e === 'step' && a.p && b.p && Math.hypot(b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2]) > 0.05;
-      if (jumped || (id !== 'camera' && a.v !== b.v)) out.push(b.t);
+    const ps = withChannel(keys, 'p');
+    for (let i = 1; i < ps.length; i++) {
+      const a = ps[i - 1], b = ps[i];
+      if ((b.ep || b.e) === 'step' && Math.hypot(b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2]) > 0.05) out.push(b.t);
     }
+    // showing switches at the key whatever its ease
+    if (id === 'camera') continue;
+    const vs = withChannel(keys, 'v');
+    for (let i = 1; i < vs.length; i++) if (vs[i - 1].v !== vs[i].v) out.push(vs[i].t);
   }
   return out;
 }
@@ -388,6 +457,7 @@ export function initAnim(c) {
   $('#animClearAll').onclick = () => {
     if (!confirmClear()) return;
     data.tracks = {};
+    data.scene = null;
     changed();
   };
   $('#animLen').oninput = () => {
@@ -447,4 +517,22 @@ export function animatedObjects() {
 /** Something new was picked in the place editor or the props. */
 export function picked(from) { source = from; if (ctx) refresh(); }
 
-export const animDebug = { get data() { return data; }, seek, apply, advance, get time() { return time; } };
+/** A whole timeline from a scene file: { length, tracks, scene }. */
+export function setScene(d) {
+  data = { length: d.length, tracks: d.tracks, scene: d.scene || null };
+  keysVersion++;
+  if (time > data.length) time = 0;
+  changed();
+}
+
+/** What the scene file said besides keys (beats, fx...), null for a hand-keyed timeline. */
+export const sceneInfo = () => data.scene || null;
+
+/** The beat playing at t (index into sceneInfo().beats), -1 between beats. */
+export function beatAt(t = time) {
+  const beats = data.scene?.beats || [];
+  for (let i = beats.length - 1; i >= 0; i--) if (t >= beats[i].t0 - 1e-6 && t < beats[i].t1) return i;
+  return -1;
+}
+
+export const animDebug = { get data() { return data; }, seek, apply, advance, get time() { return time; }, setScene, channelAt };

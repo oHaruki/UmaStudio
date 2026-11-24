@@ -45,6 +45,11 @@ the first time you open her, after that she loads from the cache.
 **Edit the place** (under Place) lets you move, turn, resize or hide its parts, from a list or by
 clicking them in the view, and stand her somewhere else on it. Changes are kept per place.
 
+**Scene files** (Render tab) are whole shorts written as code: place, umas, props, motions, faces
+and camera shots over time, in `Pictures\UmaStudio\scenes\<name>\scene.js`. The app loads one,
+reloads it when the file is saved, shows its beats over the timeline and keeps your notes on
+each beat. Format and command line tools: [docs/scenes.md](docs/scenes.md).
+
 Mouse: left drag turns the camera, right drag pans, wheel zooms.
 Keys: Space plays/pauses, W / E / R switch the prop handles, Delete removes a prop, Esc lets go,
 Ctrl+Z undoes a joint change.
@@ -55,6 +60,7 @@ Ctrl+Z undoes a joint change.
 | --- | --- |
 | Saved PNGs and videos | `Pictures\UmaStudio\renders` |
 | Your pictures (for props and backgrounds) | `Pictures\UmaStudio\images` |
+| Scene files, their notes and sheets | `Pictures\UmaStudio\scenes` |
 | Converted characters, props, backgrounds | `Pictures\UmaStudio\viewer-cache` |
 | Game file list cache, log | `%LOCALAPPDATA%\UmaStudio` |
 

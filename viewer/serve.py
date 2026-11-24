@@ -35,7 +35,7 @@ import gamepaths  # noqa: E402
 # of seconds.
 cyspring = motionnames = offline = story = umaconv = umadata = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PORT = 27620
 CONFIG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "UmaStudio")   # = umadata.CONFIG
 ROOT = os.path.join(os.path.expanduser("~"), "Pictures", "UmaStudio")
@@ -47,6 +47,7 @@ IMAGES = os.path.join(ROOT, "images")
 MODELS = os.path.join(ROOT, "models")
 ANIMS = os.path.join(ROOT, "animations")
 BLENDER_OUT = os.path.join(ROOT, "blender")
+SCENES = os.path.join(ROOT, "scenes")
 LIBRARY_DIR = os.path.join(CACHE, "_library")
 ICONS = os.path.join(CACHE, "_icons")
 PROPS = os.path.join(CACHE, "_props")
@@ -1038,6 +1039,43 @@ def native_window(url):
         return False
 
 
+# --- scene files -------------------------------------------------------------------------------
+#
+# a scene is a folder in Pictures\UmaStudio\scenes with a scene.js the page runs (scenekit.js).
+# the page writes back next to it: notes per beat, the voice script, check results, sheets.
+
+SCENE_NAME = re.compile(r"[\w\-. ]{1,80}")
+SCENE_OUT = re.compile(r"(notes|script|check)\.json|sheets/[\w\-. ]{1,100}\.png")
+
+
+def scene_list():
+    out = []
+    if os.path.isdir(SCENES):
+        for d in os.listdir(SCENES):
+            if SCENE_NAME.fullmatch(d) and os.path.isfile(os.path.join(SCENES, d, "scene.js")):
+                out.append({"name": d, "time": scene_stamp(d)})
+    return sorted(out, key=lambda x: -x["time"])
+
+
+def scene_stamp(name):
+    """Newest change to a scene's code (scene.js and the .js files next to it)."""
+    folder = os.path.join(SCENES, name)
+    return max((os.path.getmtime(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".js")), default=0)
+
+
+def scene_put(name, rel, data):
+    rel = rel.replace("\\", "/")
+    if not SCENE_NAME.fullmatch(name) or not SCENE_OUT.fullmatch(rel):
+        raise ValueError("bad file")
+    path = safe_join(os.path.join(SCENES, name), rel)
+    if not path:
+        raise ValueError("bad file")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 # --- HTTP ------------------------------------------------------------------------------------
 
 def safe_join(base, rel):
@@ -1154,6 +1192,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._send(404, {"ok": False, "error": "no such job"})
                 return self._send(200, {"ok": True, **job})
+            if p == "/api/scenes":
+                return self._send(200, {"ok": True, "items": scene_list()})
+            if p == "/api/scenes/stamp":
+                name = q.get("name", "")
+                ok = SCENE_NAME.fullmatch(name) and os.path.isdir(os.path.join(SCENES, name))
+                return self._send(200, {"ok": True, "time": scene_stamp(name)} if ok else {"ok": False})
+            if p.startswith("/scenes/"):
+                return self._file(safe_join(SCENES, p[len("/scenes/"):]))
             if p == "/api/anims":
                 return self._send(200, {"ok": True, "items": model_list(ANIMS)})
             if p.startswith("/anims/"):
@@ -1190,6 +1236,12 @@ class Handler(BaseHTTPRequestHandler):
                 qs = parse_qs(urlparse(self.path).query)
                 blender_put(qs.get("dir", [""])[0], qs.get("path", [""])[0], raw)
                 return self._send(200, {"ok": True})
+            if self.path.startswith("/api/scenes/put"):
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    return self._send(200, {"ok": True, "path": scene_put(qs.get("name", [""])[0], qs.get("path", [""])[0], raw)})
+                except ValueError as e:
+                    return self._send(400, {"ok": False, "error": str(e)})
             if self.path.startswith("/api/anims/upload"):
                 name = parse_qs(urlparse(self.path).query).get("name", ["animation"])[0]
                 try:
@@ -1268,7 +1320,9 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     return self._send(400, {"ok": False, "error": str(e)})
             if self.path == "/api/open":
-                target = {"renders": RENDERS, "images": IMAGES, "models": MODELS, "anims": ANIMS}.get(body.get("what"), ROOT)
+                target = {"renders": RENDERS, "images": IMAGES, "models": MODELS, "anims": ANIMS, "scenes": SCENES}.get(body.get("what"), ROOT)
+                if body.get("what") == "scenes" and SCENE_NAME.fullmatch(body.get("name") or ""):
+                    target = os.path.join(SCENES, body["name"])
                 os.makedirs(target, exist_ok=True)
                 subprocess.Popen(["explorer", target])
                 return self._send(200, {"ok": True})
